@@ -1,0 +1,12 @@
+{
+  "name": "focus",
+  "displayName": "TaskBeacon Focus",
+  "description": "Lets TaskBeacon focus the exact integrated terminal of a Claude session across any window.",
+  "publisher": "taskbeacon",
+  "version": "0.0.3",
+  "engines": { "vscode": "^1.74.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished", "onUri"],
+  "main": "./extension.js",
+  "contributes": {}
+}

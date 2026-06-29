@@ -1,0 +1,867 @@
+import Cocoa
+import Darwin
+import ApplicationServices
+
+// One row in the menu = one live Claude session (one interactive `claude`
+// process). Two sessions in the same VSCode window become two rows.
+struct SessionRow {
+    let title: String      // display title — folder name, suffixed with the tty
+                           // when the same folder has >1 session, e.g. "fleet-bar · ttys006"
+    let folder: String     // top folder name of the cwd, e.g. ".claude"
+    let cwd: String        // the session's working directory
+    let shellPid: pid_t    // parent shell pid == VSCode `terminal.processId`, used to focus
+    let tty: String        // controlling tty, e.g. "ttys006" (label + disambiguation)
+    let status: String     // internal: needs / working / done / seen / idle
+
+    // Stable identity for ack/toast bookkeeping. shellPid (the session's parent
+    // shell) is unique per live process; tty+cwd keep it stable and readable even
+    // if shellPid is momentarily unavailable.
+    var id: String { "tty:\(tty):\(cwd)#\(shellPid)" }
+}
+
+// MARK: - Status (internal taxonomy)
+//   needs   红   等你确认（ground truth from Notification hook flag file）
+//   working 蓝   正在执行（转圈圈）
+//   done    绿   跑完等输入
+//   seen    灰  done 已被点开看过，回落成灰直到该会话出现新动静（needs 不走这里，
+//               它保持红色直到 hook 反映真实确认）
+//   idle    灰白 闲置/连接中
+
+enum Status {
+    static func rank(_ s: String) -> Int {
+        switch s {
+        case "needs":   return 0
+        case "working": return 1
+        case "done":    return 2
+        default:        return 3   // seen / idle 都排最后
+        }
+    }
+    static func color(_ s: String) -> NSColor {
+        switch s {
+        case "needs":   return .systemRed
+        case "working": return .systemBlue
+        case "done":    return .systemGreen
+        default:        return .lightGray
+        }
+    }
+    static func label(_ s: String) -> String {
+        switch s {
+        case "needs":   return "需确认"
+        case "working": return "运行中"
+        case "done":    return "完成"
+        case "seen":    return "已确认"
+        default:        return "闲置"
+        }
+    }
+}
+
+// MARK: - Toast (floating banner)
+//
+// A borderless, non-activating panel that pops in the top-right corner when a
+// session transitions to "needs" / "done". Click → jump to VSCode + dismiss;
+// otherwise auto-dismisses. Multiple toasts stack downward.
+
+final class ClickableEffectView: NSVisualEffectView {
+    var onClick: (() -> Void)?
+    override func mouseDown(with event: NSEvent) { onClick?() }
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+    // Route every click (even over the labels/bar) to self, so the whole banner
+    // is one button — otherwise an NSTextField label swallows the mouseDown.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(convert(point, from: superview)) ? self : nil
+    }
+}
+
+final class ToastManager {
+    static let shared = ToastManager()
+
+    // A stretchable rounded-rect mask for NSVisualEffectView. Center-stretch
+    // (capInsets) keeps the corners crisp at any panel size.
+    static func roundedMask(radius: CGFloat) -> NSImage {
+        let edge = radius * 2 + 1
+        let img = NSImage(size: NSSize(width: edge, height: edge), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
+        img.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+        img.resizingMode = .stretch
+        return img
+    }
+
+    private var toasts: [(panel: NSPanel, path: String)] = []
+    // Apple-notification proportions: icon-height + padding, just tall enough for
+    // a two-line text block. The status pill caps the top-right like a timestamp,
+    // so the card reads as one tight unit instead of a sparse bar.
+    private let width: CGFloat = 356
+    private let height: CGFloat = 78
+    private let margin: CGFloat = 14
+    private let spacing: CGFloat = 10
+    private let lifetime: TimeInterval = 8
+
+    // path is the identity: a fresh transition for the same project replaces the
+    // old toast instead of stacking a duplicate.
+    func show(title: String, status: String, path: String, onClick: @escaping () -> Void) {
+        dismiss(path)
+
+        let panel = makePanel(title: title, status: status) { [weak self] in
+            onClick()
+            self?.dismiss(path)
+        }
+        toasts.append((panel, path))
+        relayout()
+
+        panel.alphaValue = 1
+        panel.orderFrontRegardless()
+
+        // "needs" (red, awaiting your input) is the one you must not miss, so it
+        // stays put until clicked (or the terminal is focused → dismiss(shellPid:)).
+        // Everything else (done) is informational and auto-dismisses.
+        if status != "needs" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { [weak self] in
+                self?.dismiss(path)
+            }
+        }
+    }
+
+    // Dismiss any toast belonging to a given session shell pid. Paths end with
+    // "#<shellPid>" (see SessionRow.id), so the user focusing that terminal can
+    // clear its banner without needing the exact path.
+    func dismiss(shellPid pid: pid_t) {
+        let suffix = "#\(pid)"
+        for path in toasts.map({ $0.path }) where path.hasSuffix(suffix) { dismiss(path) }
+    }
+
+    func dismiss(_ path: String) {
+        guard let idx = toasts.firstIndex(where: { $0.path == path }) else { return }
+        let panel = toasts.remove(at: idx).panel
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.18
+            panel.animator().alphaValue = 0
+        }, completionHandler: {
+            panel.orderOut(nil)
+        })
+        relayout()
+    }
+
+    private func relayout() {
+        guard let screen = NSScreen.main else { return }
+        let vf = screen.visibleFrame
+        let x = vf.maxX - width - margin
+        var y = vf.maxY - margin - height
+        for (panel, _) in toasts {
+            panel.setFrameOrigin(NSPoint(x: x, y: y))
+            y -= (height + spacing)
+        }
+    }
+
+    private func makePanel(title: String, status: String, onClick: @escaping () -> Void) -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered, defer: false)
+        panel.isFloatingPanel = true
+        panel.level = .statusBar
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+
+        let radius: CGFloat = 19   // softer, Apple-notification squircle
+        let effect = ClickableEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        effect.material = .hudWindow
+        effect.state = .active
+        effect.blendingMode = .behindWindow
+        effect.wantsLayer = true
+        // Clip the blur material with a resizable rounded-rect maskImage. Plain
+        // layer.cornerRadius + masksToBounds does NOT reliably clip an
+        // NSVisualEffectView's material, so the square corners of the blur leak
+        // out as light/white triangles — this masks them off cleanly.
+        effect.maskImage = ToastManager.roundedMask(radius: radius)
+        effect.layer?.cornerRadius = radius
+        effect.layer?.cornerCurve = .continuous
+        effect.layer?.borderWidth = 1
+        effect.layer?.borderColor = Theme.hairline.cg(in: effect)
+        effect.layer?.masksToBounds = true
+        effect.onClick = onClick
+
+        // Specular top-edge sheen — same glass-thickness cue as the window cards,
+        // so a toast reads as the same material floating free.
+        let sheen = CAGradientLayer()
+        sheen.frame = effect.bounds
+        sheen.cornerRadius = radius
+        sheen.cornerCurve = .continuous
+        sheen.startPoint = CGPoint(x: 0.5, y: 1.0)
+        sheen.endPoint   = CGPoint(x: 0.5, y: 0.72)
+        // Transparent WHITE end (not NSColor.clear = transparent black, which
+        // would interpolate through grey and paint a dark band at the fade).
+        sheen.colors = [Theme.sheen.cg(in: effect), NSColor.white.withAlphaComponent(0).cgColor]
+        effect.layer?.addSublayer(sheen)
+
+        // Left "app icon" tile — a tinted rounded square holding the glowing dot.
+        // This left-aligned icon block is what reads as an Apple notification.
+        let iconTile = NSView()
+        iconTile.wantsLayer = true
+        iconTile.layer?.cornerRadius = 12
+        iconTile.layer?.cornerCurve = .continuous
+        iconTile.layer?.backgroundColor = Status.tint(status).cgColor
+        iconTile.layer?.borderWidth = 1
+        iconTile.layer?.borderColor = Status.accent(status).withAlphaComponent(0.35).cgColor
+        iconTile.translatesAutoresizingMaskIntoConstraints = false
+        effect.addSubview(iconTile)
+
+        let dot = StatusDot(diameter: 14)
+        dot.apply(status)
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        iconTile.addSubview(dot)
+
+        let nameLabel = NSTextField(labelWithString: title)
+        nameLabel.font = Theme.font(14.5, .semibold)
+        nameLabel.textColor = .labelColor
+        nameLabel.lineBreakMode = .byTruncatingTail
+        nameLabel.translatesAutoresizingMaskIntoConstraints = false
+        effect.addSubview(nameLabel)
+
+        let hintLabel = NSTextField(labelWithString: "click → jump to VSCode")
+        hintLabel.font = Theme.font(12, .medium)
+        hintLabel.textColor = .secondaryLabelColor
+        hintLabel.translatesAutoresizingMaskIntoConstraints = false
+        effect.addSubview(hintLabel)
+
+        let pill = CapsuleLabel(showDot: false)
+        pill.configure(status: status, text: Status.label(status))
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        effect.addSubview(pill)
+
+        // Two-line text block (title + hint) sits centered on the icon's vertical
+        // axis; the pill aligns to the title baseline like an Apple timestamp.
+        NSLayoutConstraint.activate([
+            iconTile.leadingAnchor.constraint(equalTo: effect.leadingAnchor, constant: 15),
+            iconTile.centerYAnchor.constraint(equalTo: effect.centerYAnchor),
+            iconTile.widthAnchor.constraint(equalToConstant: 40),
+            iconTile.heightAnchor.constraint(equalToConstant: 40),
+
+            dot.centerXAnchor.constraint(equalTo: iconTile.centerXAnchor),
+            dot.centerYAnchor.constraint(equalTo: iconTile.centerYAnchor),
+            dot.widthAnchor.constraint(equalToConstant: 14),
+            dot.heightAnchor.constraint(equalToConstant: 14),
+
+            nameLabel.leadingAnchor.constraint(equalTo: iconTile.trailingAnchor, constant: 12),
+            nameLabel.bottomAnchor.constraint(equalTo: effect.centerYAnchor, constant: -1),
+            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: pill.leadingAnchor, constant: -8),
+
+            hintLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
+            hintLabel.topAnchor.constraint(equalTo: effect.centerYAnchor, constant: 3),
+
+            pill.trailingAnchor.constraint(equalTo: effect.trailingAnchor, constant: -15),
+            pill.centerYAnchor.constraint(equalTo: nameLabel.centerYAnchor),
+        ])
+
+        panel.contentView = effect
+        return panel
+    }
+}
+
+// MARK: - App controller
+
+class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
+
+    private var statusItem: NSStatusItem!
+    private var rows: [SessionRow] = []
+    private var dataTimer: Timer?
+    private var animTimer: Timer?
+    // Held for the app's lifetime to opt out of App Nap. Without it, macOS
+    // throttles our timers the moment we drop to the background (which happens
+    // every time a click jumps focus to VSCode), freezing the spinner *and* the
+    // poll that would recover it.
+    private var activityToken: NSObjectProtocol?
+
+    private var menuRows: [(item: NSMenuItem, row: SessionRow)] = []
+    private var mainWindowController: MainWindowController?
+
+    // Last seen status per session id; used to fire a toast only on the
+    // transition *into* needs/done. `primed` suppresses a burst of toasts for
+    // whatever was already needs/done at launch.
+    private var lastStatus: [String: String] = [:]
+    private var primed = false
+
+    // Sessions the user has clicked-to-acknowledge: session id → the needs/done
+    // status that was dismissed. While the real status stays equal to this, the
+    // row is shown gray ("已确认"); once it moves on (new work) the entry is
+    // dropped and the real color returns. Mutated only on the main thread.
+    private var acked: [String: String] = [:]
+
+    // The companion extension writes "<shellPid>:<nonce>" to active-terminal on
+    // every terminal focus; `lastFocusToken` dedupes so each poll acts only on a
+    // genuinely new focus, never re-acting on an unchanged value.
+    private var lastFocusToken = ""
+
+    private let spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    private var spinnerIndex = 0
+    private var spinner: String { spinnerFrames[spinnerIndex % spinnerFrames.count] }
+
+    private let menuFont = NSFont.menuFont(ofSize: 0)
+    private let dataDir = "\(NSHomeDirectory())/.claude/taskbeacon"
+    private let vscodeExtDir = "\(NSHomeDirectory())/.vscode/extensions"
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // .regular = full app with a Dock icon + main window (not a pure menu-bar
+        // accessory). The status item and toasts still work alongside it.
+        NSApp.setActivationPolicy(.regular)
+
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.button?.title = "…"
+
+        let menu = NSMenu()
+        menu.delegate = self
+        statusItem.menu = menu
+
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated], reason: "Live Claude session monitoring")
+
+        lastFocusToken = readFocusToken()   // prime: ignore whatever focus is already recorded
+        showMainWindow()
+        refresh()
+        // Surface the one permission this app needs up front, so the user enables it
+        // before discovering a dead-feeling click later (rather than on first jump).
+        requestAccessibilityIfNeeded()
+        // Scheduled on .common so they keep firing while the status-bar menu is
+        // open (event-tracking mode); App Nap is handled by activityToken above.
+        let dt = Timer(timeInterval: 2.5, repeats: true) { [weak self] _ in self?.refresh() }
+        let at = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(dt, forMode: .common)
+        RunLoop.main.add(at, forMode: .common)
+        dataTimer = dt
+        animTimer = at
+    }
+
+    // MARK: Data
+
+    private func refresh() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            let realRows = self.fetchRows()
+            DispatchQueue.main.async {
+                let rows = self.applyAck(realRows)
+                self.rows = rows
+                self.updateButton()
+                self.notifyTransitions(rows)
+                self.dismissFocusedToast()
+                self.mainWindowController?.reload(rows)
+            }
+        }
+    }
+
+    // Build one row per live Claude session by discovering them ourselves.
+    //
+    // We don't shell out to c9watch anymore: Claude Code v2.1's daemon/bg-pty-host
+    // architecture stopped putting `--session-id` in the argv of interactive
+    // terminal sessions, so any argv-scraping tool silently misses them (that was
+    // the "3 VSCode windows but only 1 shows" bug). Instead we enumerate processes,
+    // keep the interactive `claude` ones, and read each one's cwd, parent-shell pid
+    // and tty (via libproc). Status comes from the per-tty state file the hook writes.
+    // Each process is its own row, so two AIs sharing one VSCode window show separately.
+    private func fetchRows() -> [SessionRow] {
+        let sessions = discoverSessions()
+        // A folder is "shared" when >1 session live in it; those rows get the tty
+        // appended to the title so they're distinguishable at a glance.
+        var folderCount: [String: Int] = [:]
+        for s in sessions { folderCount[s.cwd, default: 0] += 1 }
+
+        // Real status only; ack-overlay + final sort happen on the main thread.
+        return sessions.map { s in
+            let folder = (s.cwd as NSString).lastPathComponent
+            let dup = (folderCount[s.cwd] ?? 0) > 1 && !s.tty.isEmpty
+            let title = dup ? "\(folder) · \(s.tty)" : folder
+            return SessionRow(title: title, folder: folder, cwd: s.cwd,
+                              shellPid: s.shellPid, tty: s.tty,
+                              status: sessionStatus(tty: s.tty))
+        }
+    }
+
+    // Overlay the user's acknowledgements, then sort. Runs on the main thread so
+    // `acked` is only ever touched from one queue.
+    private func applyAck(_ realRows: [SessionRow]) -> [SessionRow] {
+        let live = Set(realRows.map { $0.id })
+        acked = acked.filter { live.contains($0.key) }   // forget vanished sessions
+
+        var rows = realRows.map { r -> SessionRow in
+            if let a = acked[r.id] {
+                if a == r.status {                        // still the acked state → gray
+                    return SessionRow(title: r.title, folder: r.folder, cwd: r.cwd,
+                                      shellPid: r.shellPid, tty: r.tty, status: "seen")
+                }
+                acked.removeValue(forKey: r.id)           // moved on → real color returns
+            }
+            return r
+        }
+        rows.sort {
+            let r0 = Status.rank($0.status), r1 = Status.rank($1.status)
+            return r0 != r1 ? r0 < r1 : $0.title < $1.title
+        }
+        return rows
+    }
+
+    // Mark a `done` session seen, so its row greys to "已确认" until new work arrives.
+    // The ONLY trigger is the companion extension reporting you actually focused that
+    // terminal (via dismissFocusedToast) — never a mere click on the toast/row/menu.
+    // `done` has no ground-truth "seen" signal of its own, so this focus-driven ack
+    // is the mechanism; it's dropped once the real status moves on.
+    //
+    // `needs` is deliberately NOT ack-able: focusing the terminal isn't answering the
+    // prompt. It stays red until you actually respond and the hook flips the state
+    // (working/done) — the authoritative signal. Graying it on anything less would
+    // misreport "已确认" before you'd confirmed anything.
+    private func acknowledge(_ id: String, status: String) {
+        guard status == "done" else { return }
+        acked[id] = status
+        refresh()
+    }
+
+    // MARK: Session discovery (libproc)
+
+    // A live interactive `claude` process and the bits we need to render + focus it.
+    private struct LiveSession {
+        let cwd: String
+        let shellPid: pid_t
+        let tty: String
+    }
+
+    private func discoverSessions() -> [LiveSession] {
+        var out: [LiveSession] = []
+        for pid in allPIDs() {
+            let args = processArgs(pid)
+            guard let arg0 = args.first,
+                  (arg0 as NSString).lastPathComponent == "claude" else { continue }
+            // Skip the daemon supervisor, bg-pty-host/spare workers, and Electron
+            // helper subprocesses — none are user-facing terminal sessions.
+            // Also skip the Claude Code VSCode extension's headless claude: it's
+            // driven over stdio with --output-format/--input-format stream-json, its
+            // parent is the plugin host (not a shell) and it owns no tty, so it can't
+            // be focused as a terminal and never resolves a status. Those flags never
+            // appear on an interactive terminal session.
+            if args.contains(where: {
+                $0 == "daemon" || $0 == "--bg-pty-host"
+                    || $0 == "--bg-spare" || $0.hasPrefix("--type=")
+                    || $0 == "--output-format" || $0 == "--input-format"
+            }) { continue }
+            guard let cwd = processCWD(pid), !cwd.isEmpty else { continue }
+            let bsd = processBSDInfo(pid)
+            out.append(LiveSession(
+                cwd: cwd,
+                shellPid: bsd?.ppid ?? 0,
+                tty: bsd?.tty ?? ""))
+        }
+        return out
+    }
+
+    private func allPIDs() -> [pid_t] {
+        let cap = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
+        guard cap > 0 else { return [] }
+        var pids = [pid_t](repeating: 0, count: Int(cap) / MemoryLayout<pid_t>.size)
+        let n = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pids, cap)
+        guard n > 0 else { return [] }
+        return Array(pids.prefix(Int(n) / MemoryLayout<pid_t>.size)).filter { $0 > 0 }
+    }
+
+    // argv via KERN_PROCARGS2 layout:
+    //   [Int32 argc][exec_path\0][pad\0…][argv…][env…]
+    // We only need argv (to recognize `claude` and skip daemon/bg-host workers); the
+    // env that follows is ignored — session identity now comes from the per-tty state
+    // file, not from the (inherited, unreliable) CLAUDE_CODE_* env vars.
+    private func processArgs(_ pid: pid_t) -> [String] {
+        var mib = [CTL_KERN, KERN_PROCARGS2, Int32(pid)]
+        var size = 0
+        if sysctl(&mib, 3, nil, &size, nil, 0) < 0 || size == 0 { return [] }
+        var buf = [UInt8](repeating: 0, count: size)
+        if sysctl(&mib, 3, &buf, &size, nil, 0) < 0 { return [] }
+        guard size > MemoryLayout<Int32>.size else { return [] }
+        var argc: Int32 = 0
+        withUnsafeMutableBytes(of: &argc) { $0.copyBytes(from: buf[0..<MemoryLayout<Int32>.size]) }
+        var i = MemoryLayout<Int32>.size
+        while i < size && buf[i] != 0 { i += 1 }   // skip exec_path
+        while i < size && buf[i] == 0 { i += 1 }   // skip padding NULs
+        var args: [String] = []
+        var collected: Int32 = 0
+        while collected < argc && i < size {
+            let start = i
+            while i < size && buf[i] != 0 { i += 1 }
+            if let s = String(bytes: buf[start..<i], encoding: .utf8) { args.append(s) }
+            i += 1
+            collected += 1
+        }
+        return args
+    }
+
+    // ppid + controlling-tty name (e.g. "ttys006") via libproc. ppid is the parent
+    // shell pid, which is exactly what VSCode reports as `terminal.processId` — the
+    // key the companion extension matches on to focus the right terminal.
+    private func processBSDInfo(_ pid: pid_t) -> (ppid: pid_t, tty: String)? {
+        var info = proc_bsdinfo()
+        let sz = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sz) == sz else { return nil }
+        var tty = ""
+        if info.e_tdev != UInt32.max, let c = devname(dev_t(info.e_tdev), S_IFCHR) {
+            tty = String(cString: c)
+        }
+        return (pid_t(info.pbi_ppid), tty)
+    }
+
+    private func processCWD(_ pid: pid_t) -> String? {
+        var info = proc_vnodepathinfo()
+        let sz = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, sz) == sz else { return nil }
+        return withUnsafePointer(to: &info.pvi_cdir.vip_path) {
+            $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+        }
+    }
+
+    // MARK: Session status
+    //
+    // The status comes straight from the per-tty state file the taskbeacon-status hook
+    // writes (~/.claude/taskbeacon/state-<tty>). We no longer infer it from the transcript:
+    // Claude Code v2.1's daemon stopped writing a discoverable <session>.jsonl for live
+    // terminal sessions, so transcript-mtime made everything look "working". The hooks
+    // fire on the exact transitions instead:
+    //   needs   红   permission/confirmation Notification
+    //   working 蓝   UserPromptSubmit / PreToolUse (model is busy)
+    //   done    绿   Stop (turn ended) or idle "waiting for your input" Notification
+    //   idle    灰   no state reported yet (fresh session, or hook hasn't fired)
+    private func sessionStatus(tty: String) -> String {
+        guard !tty.isEmpty else { return "idle" }
+        let s = (try? String(contentsOfFile: "\(dataDir)/state-\(tty)", encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        switch s {
+        case "needs", "working", "done": return s
+        default:                         return "idle"
+        }
+    }
+
+    // Fire a toast whenever a session newly enters needs/done.
+    private func notifyTransitions(_ newRows: [SessionRow]) {
+        if primed {
+            for row in newRows where row.status == "needs" || row.status == "done" {
+                if lastStatus[row.id] != row.status {
+                    ToastManager.shared.show(title: row.title, status: row.status, path: row.id) { [weak self] in
+                        self?.focus(row)
+                    }
+                }
+            }
+        }
+        // Auto-dismiss once a session leaves needs/done — e.g. the user went to
+        // the terminal and continued, flipping it to working via the hook. This
+        // is the fallback for setups without the companion extension's focus
+        // reporting; dismiss() is a no-op when there's no toast for the id.
+        for row in newRows where row.status != "needs" && row.status != "done" {
+            ToastManager.shared.dismiss(row.id)
+        }
+        // Defensive merge: ids are unique by shellPid, but never let a stray
+        // collision trap the whole app.
+        lastStatus = Dictionary(newRows.map { ($0.id, $0.status) }, uniquingKeysWith: { _, new in new })
+        primed = true
+    }
+
+    // MARK: Rendering
+
+    private func glyph(_ status: String) -> String {
+        status == "working" ? spinner : "●"
+    }
+
+    private func rowAttributed(_ row: SessionRow) -> NSAttributedString {
+        let m = NSMutableAttributedString()
+        m.append(NSAttributedString(string: glyph(row.status) + "  ",
+                                    attributes: [.foregroundColor: Status.color(row.status), .font: menuFont]))
+        m.append(NSAttributedString(string: row.title,
+                                    attributes: [.font: menuFont]))
+        return m
+    }
+
+    private func updateButton() {
+        let m = NSMutableAttributedString()
+        func seg(_ g: String, _ n: Int, _ c: NSColor) {
+            guard n > 0 else { return }
+            if m.length > 0 { m.append(NSAttributedString(string: " ")) }
+            m.append(NSAttributedString(string: "\(g)\(n)", attributes: [.foregroundColor: c]))
+        }
+        let needs   = rows.filter { $0.status == "needs"   }.count
+        let working = rows.filter { $0.status == "working" }.count
+        let done    = rows.filter { $0.status == "done"    }.count
+        let idle    = rows.count - needs - working - done
+
+        seg("●", needs, .systemRed)
+        seg(spinner, working, .systemBlue)
+        seg("●", done, .systemGreen)
+        seg("●", idle, .lightGray)
+        if m.length == 0 {
+            m.append(NSAttributedString(string: "●", attributes: [.foregroundColor: NSColor.lightGray]))
+        }
+        statusItem.button?.attributedTitle = m
+    }
+
+    private func tick() {
+        guard rows.contains(where: { $0.status == "working" }) else { return }
+        spinnerIndex += 1
+        updateButton()
+        for entry in menuRows where entry.row.status == "working" {
+            entry.item.attributedTitle = rowAttributed(entry.row)
+        }
+    }
+
+    // MARK: Menu
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        menuRows.removeAll()
+
+        if rows.isEmpty {
+            let item = NSMenuItem(title: "没有在跑的 Claude", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        } else {
+            let header = NSMenuItem(
+                title: "\(rows.count) 个会话",
+                action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+            menu.addItem(.separator())
+
+            for row in rows {
+                let item = NSMenuItem(title: "", action: #selector(jump(_:)), keyEquivalent: "")
+                item.attributedTitle = rowAttributed(row)
+                item.target = self
+                item.representedObject = row.id
+                menu.addItem(item)
+                menuRows.append((item, row))
+            }
+        }
+
+        menu.addItem(.separator())
+        // Persistent affordance: only while the jump permission is missing, so the
+        // user can always re-open the enable flow if they dismissed the launch prompt.
+        if !AXIsProcessTrusted() {
+            let axItem = NSMenuItem(title: "⚠️ 开启跳转权限（辅助功能）",
+                                    action: #selector(presentAccessibilityPrompt), keyEquivalent: "")
+            axItem.target = self
+            menu.addItem(axItem)
+        }
+        let openItem = NSMenuItem(title: "🪟 打开主界面", action: #selector(openMainWindow), keyEquivalent: "o")
+        openItem.target = self
+        menu.addItem(openItem)
+        let refreshItem = NSMenuItem(title: "🔄 刷新", action: #selector(manualRefresh), keyEquivalent: "r")
+        refreshItem.target = self
+        menu.addItem(refreshItem)
+        let quitItem = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuRows.removeAll()
+    }
+
+    // MARK: Actions
+
+    @objc private func jump(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let row = rows.first(where: { $0.id == id }) else { return }
+        focus(row)
+    }
+
+    // Jump to this session. When the companion extension is installed we also write
+    // the target shellPid to the focus-request file that every VSCode window watches;
+    // the window owning the terminal whose `processId` == shellPid reveals that exact
+    // pane, landing on its input.
+    //
+    // The OS-level window raise is done by `raiseVSCodeWindow` (Accessibility API),
+    // not the extension's `term.show` (which only swaps the pane *inside* its window).
+    private func focus(_ row: SessionRow) {
+        if row.shellPid > 0 && extensionInstalled() {
+            requestTerminalFocus(shellPid: row.shellPid)
+        }
+        raiseVSCodeWindow(cwd: row.cwd)
+    }
+
+    // The nonce makes every request a distinct write, so the extension's file
+    // watcher fires even when the same session is focused twice in a row.
+    private var focusSeq = 0
+    private func requestTerminalFocus(shellPid: pid_t) {
+        focusSeq += 1
+        try? FileManager.default.createDirectory(
+            atPath: dataDir, withIntermediateDirectories: true)
+        try? "\(shellPid):\(focusSeq)".write(
+            toFile: "\(dataDir)/focus-request", atomically: true, encoding: .utf8)
+    }
+
+    // MARK: Auto-dismiss on terminal focus
+    //
+    // The companion extension writes "<shellPid>:<nonce>" to active-terminal each
+    // time the user focuses a terminal. On every poll we read it and, on a *new*
+    // token, clear that session's toast and mark it seen: going to the terminal
+    // yourself is the same as clicking the banner.
+    private func readFocusToken() -> String {
+        (try? String(contentsOfFile: "\(dataDir)/active-terminal", encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private func dismissFocusedToast() {
+        let token = readFocusToken()
+        guard token != lastFocusToken else { return }   // no new focus since last poll
+        lastFocusToken = token
+        guard let head = token.split(separator: ":").first,
+              let pid = pid_t(head), pid > 0 else { return }
+        ToastManager.shared.dismiss(shellPid: pid)
+        if let row = rows.first(where: { $0.shellPid == pid }) {
+            acknowledge(row.id, status: row.status)   // no-op unless done
+        }
+    }
+
+    // Raise the folder's VSCode window (no single terminal to focus). Used when a
+    // group header — which represents a whole window — is clicked.
+    private func focusFolder(_ cwd: String) {
+        raiseVSCodeWindow(cwd: cwd)
+    }
+
+    // Bring the VSCode window that owns `cwd` to the front — even when VSCode is
+    // ALREADY the frontmost app (e.g. you're sitting in another VSCode window on a
+    // second monitor). `open -b <bundle> <cwd>` only raises the window when VSCode
+    // is NOT frontmost: LaunchServices treats an already-active app whose folder is
+    // already open as "nothing to do" and no-ops, so the target window never comes
+    // forward (the multi-monitor jump bug). The Accessibility API raises the exact
+    // window regardless of which app/window is currently frontmost, across displays
+    // and Spaces. We match the window by its title, which carries the workspace
+    // folder name. Falls back to `open` when AX isn't granted or no window matches.
+    private func raiseVSCodeWindow(cwd: String) {
+        guard AXIsProcessTrusted(),
+              let app = NSRunningApplication.runningApplications(
+                  withBundleIdentifier: "com.microsoft.VSCode").first else {
+            requestAccessibilityIfNeeded()
+            run("/usr/bin/open", ["-b", "com.microsoft.VSCode", cwd])
+            return
+        }
+        let appEl = AXUIElementCreateApplication(app.processIdentifier)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement] else {
+            run("/usr/bin/open", ["-b", "com.microsoft.VSCode", cwd])
+            return
+        }
+        let target = URL(fileURLWithPath: cwd).lastPathComponent
+        for win in windows {
+            var titleRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
+                  let title = titleRef as? String, title.contains(target) else { continue }
+            AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+            app.activate(options: [])   // window already ordered front by the raise
+            return
+        }
+        // Folder not open in any window — let `open` create/raise it.
+        run("/usr/bin/open", ["-b", "com.microsoft.VSCode", cwd])
+    }
+
+    // Accessibility is the one permission this app needs: raiseVSCodeWindow uses
+    // kAXRaiseAction to bring the target VSCode window forward even when VSCode is
+    // already frontmost. Without it, jumping falls back to `open`, which can't raise
+    // a window across monitors / a fullscreen Space while VSCode is already active —
+    // the click feels dead. So we explain exactly what's gated (rather than popping
+    // the bare system prompt) and route the user straight to the settings pane.
+    //
+    // Shown at most once per session (`promptedForAX`); once granted, AXIsProcessTrusted
+    // is true and this never fires again. A persistent menu item (added while untrusted)
+    // lets the user re-open this if they dismissed it.
+    private var promptedForAX = false
+
+    // Guarded entry: fires at most once per session and only while untrusted. Used by
+    // launch and the jump fallback so a dead click doesn't nag on every attempt.
+    private func requestAccessibilityIfNeeded() {
+        guard !AXIsProcessTrusted(), !promptedForAX else { return }
+        promptedForAX = true
+        presentAccessibilityPrompt()
+    }
+
+    // Force entry: the menu item ("⚠️ 开启跳转权限") always re-opens this.
+    @objc private func presentAccessibilityPrompt() {
+        guard !AXIsProcessTrusted() else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "需要开启「辅助功能」权限"
+        alert.informativeText = """
+            TaskBeacon 需要「辅助功能」权限，才能在你点击会话时把对应的 VSCode 窗口抬到最前 —— 尤其是跨显示器、或目标窗口在另一个全屏 Space 时。
+
+            ⚠️ 未开启时无法使用：
+            • 点列表 / 通知横幅跳转到另一台屏幕（或全屏）上的 VSCode 窗口
+            • 多窗口时只能切到当前最前那个，点谁都跳不准
+
+            ✅ 不受影响：状态监控、通知横幅、提示音照常工作。
+
+            开启：系统设置 → 隐私与安全性 → 辅助功能 → 打开 TaskBeacon。
+            """
+        alert.addButton(withTitle: "打开辅助功能设置")
+        alert.addButton(withTitle: "稍后")
+        let openSettings = alert.runModal() == .alertFirstButtonReturn
+
+        // Register TaskBeacon in the Accessibility list (so it's there to toggle) via
+        // the prompt option, then deep-link to the pane so it's one switch away.
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+        if openSettings,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    // The companion extension is installed when its folder exists under
+    // ~/.vscode/extensions (named "taskbeacon.focus-<version>").
+    private func extensionInstalled() -> Bool {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: vscodeExtDir)
+        else { return false }
+        return names.contains { $0.hasPrefix("taskbeacon.focus") }
+    }
+
+    private func run(_ launchPath: String, _ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: launchPath)
+        p.arguments = args
+        try? p.run()
+    }
+
+    @objc private func manualRefresh() { refresh() }
+
+    @objc private func openMainWindow() { showMainWindow() }
+
+    @objc private func quit() { NSApp.terminate(nil) }
+
+    // MARK: Main window
+
+    private func showMainWindow() {
+        if mainWindowController == nil {
+            let wc = MainWindowController()
+            wc.onJump = { [weak self] row in self?.focus(row) }
+            wc.onJumpFolder = { [weak self] cwd in self?.focusFolder(cwd) }
+            wc.onRefresh = { [weak self] in self?.refresh() }
+            mainWindowController = wc
+        }
+        mainWindowController?.reload(rows)
+        mainWindowController?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    // Closing the window keeps the app alive in the menu bar.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    // Clicking the Dock icon (with no window open) reopens the main window.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { showMainWindow() }
+        return true
+    }
+}
+
+// MARK: - Entry point
+
+let app = NSApplication.shared
+let controller = AppController()
+app.delegate = controller
+app.run()
