@@ -8,11 +8,11 @@ import Cocoa
 // titlebar is hidden and content runs full-bleed; rows are individual glass
 // cards that brighten + glow on hover. Click a row → jump to its VSCode + mark seen.
 
-// One visual line in the list. A folder (= VSCode window) with a single session
-// renders as a lone card; a folder with several renders a header (folder name +
-// aggregate count badges) followed by one indented child per terminal.
+// One visual line in the list. Every folder (= VSCode window) renders the same
+// way regardless of session count: a header (folder name + aggregate count
+// badges) followed by one indented child per terminal. A lone session is just a
+// header with a single child — keeps the layout uniform.
 fileprivate enum DisplayItem {
-    case single(SessionRow)                                       // lone session
     case header(folder: String, cwd: String, counts: [(String, Int)])
     case child(SessionRow)                                        // session under a header
 }
@@ -102,6 +102,13 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         let scroll = NSScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.hasVerticalScroller = true
+        // Force a floating (overlay) scroller even when the system pref is "Always
+        // show scroll bars" — a legacy scroller reserves a ~15pt right gutter that
+        // shifts the cards left of the refresh button. OverlayScroller pins its
+        // reported style to .overlay so the content stays full-bleed.
+        scroll.verticalScroller = OverlayScroller()
+        scroll.scrollerStyle = .overlay
+        scroll.autohidesScrollers = true
         scroll.drawsBackground = false
         scroll.automaticallyAdjustsContentInsets = false
         scroll.contentInsets = NSEdgeInsets(top: 4, left: 0, bottom: 6, right: 0)
@@ -175,25 +182,16 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         stopSpinAfterRefresh()   // fresh data landed → end the click-triggered spin
     }
 
-    // Group the (already status-sorted) rows by folder. Folders float up by their
-    // most-urgent session so "needs" groups stay on top; within a group the rows
-    // keep their incoming status order.
+    // Group the (already stably-sorted) rows by folder. Folder order is FIXED —
+    // alphabetical by cwd — so groups never float on a status change; within a group
+    // the rows keep their incoming (session-number) order. Status only recolors.
     private static func group(_ rows: [SessionRow]) -> [DisplayItem] {
         var groups: [String: [SessionRow]] = [:]
-        var order: [String] = []
-        for r in rows {
-            if groups[r.cwd] == nil { order.append(r.cwd) }
-            groups[r.cwd, default: []].append(r)
-        }
-        let keys = order.sorted { a, b in
-            let ra = groups[a]!.map { Status.rank($0.status) }.min() ?? 99
-            let rb = groups[b]!.map { Status.rank($0.status) }.min() ?? 99
-            return ra != rb ? ra < rb : a < b
-        }
+        for r in rows { groups[r.cwd, default: []].append(r) }
+        let keys = groups.keys.sorted()
         var out: [DisplayItem] = []
         for key in keys {
             let g = groups[key]!
-            if g.count == 1 { out.append(.single(g[0])); continue }
             let folder = (key as NSString).lastPathComponent
             out.append(.header(folder: folder, cwd: key, counts: counts(g)))
             for s in g { out.append(.child(s)) }
@@ -220,7 +218,6 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
         switch items[row] {
-        case .single: return Theme.rowHeight
         case .header: return 46
         case .child:  return 50
         }
@@ -228,11 +225,6 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         switch items[row] {
-        case .single(let r):
-            let id = NSUserInterfaceItemIdentifier("single")
-            let cell = (tableView.makeView(withIdentifier: id, owner: self) as? RowCell) ?? RowCell(id: id)
-            cell.configure(r)
-            return cell
         case .header(let folder, _, let counts):
             let id = NSUserInterfaceItemIdentifier("header")
             let cell = (tableView.makeView(withIdentifier: id, owner: self) as? HeaderCell) ?? HeaderCell(id: id)
@@ -279,20 +271,32 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     }
 
     // Single click: jump to VSCode only. Status is NOT changed by the click — a row
-    // greys to "已确认" solely on ground truth: you actually landing in the terminal
+    // greys to "闲置" solely on ground truth: you actually landing in the terminal
     // (reported by the companion extension) for `done`, or the hook clearing `needs`
     // once you really answer the prompt. Optimistically graying on click misreported
-    // state ("已确认" before you'd answered anything).
+    // state ("闲置" before you'd answered anything).
     // A header click only raises the folder's window (no single terminal to focus).
     @objc private func rowClicked() {
         let r = tableView.clickedRow
         guard r >= 0 && r < items.count else { return }
         switch items[r] {
-        case .single(let row), .child(let row):
+        case .child(let row):
             onJump?(row)
         case .header(_, let cwd, _):
             onJumpFolder?(cwd)
         }
+    }
+}
+
+// A scroller that always behaves as an overlay (floating) scroller, regardless of
+// the system "Show scroll bars" preference. A legacy scroller reserves a fixed
+// gutter on the trailing edge, which would push the list cards left of the
+// refresh button; overlay scrollers float over the content and reserve nothing.
+final class OverlayScroller: NSScroller {
+    override class var isCompatibleWithOverlayScrollers: Bool { true }
+    override var scrollerStyle: NSScroller.Style {
+        get { .overlay }
+        set { super.scrollerStyle = .overlay }
     }
 }
 
@@ -302,124 +306,11 @@ final class TransparentRowView: NSTableRowView {
     override var isEmphasized: Bool { get { false } set {} }
 }
 
-// MARK: - Row cell (glass card)
-
-final class RowCell: NSTableCellView {
-    private let card = GlassCard(radius: Theme.card)
-    private let dot = StatusDot(diameter: 11)
-    private let titleLabel = NSTextField(labelWithString: "")
-    private let metaLabel = NSTextField(labelWithString: "")
-    private let pill = CapsuleLabel(showDot: false)
-    private let chevron = NSImageView()
-
-    private var status = "idle"
-    private var hovering = false
-
-    init(id: NSUserInterfaceItemIdentifier) {
-        super.init(frame: .zero)
-        identifier = id
-
-        // Card container — inset within the row for vertical breathing room.
-        card.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(card)
-
-        dot.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(dot)
-
-        titleLabel.font = Theme.font(14.5, .semibold)
-        titleLabel.textColor = .labelColor
-        titleLabel.lineBreakMode = .byTruncatingTail
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(titleLabel)
-
-        metaLabel.font = Theme.font(11.5, .medium)
-        metaLabel.textColor = .secondaryLabelColor
-        metaLabel.lineBreakMode = .byTruncatingTail
-        metaLabel.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(metaLabel)
-
-        pill.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(pill)
-
-        let cfg = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
-        chevron.image = NSImage(systemSymbolName: "arrow.up.forward", accessibilityDescription: nil)?
-            .withSymbolConfiguration(cfg)
-        chevron.contentTintColor = .tertiaryLabelColor
-        chevron.alphaValue = 0
-        chevron.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(chevron)
-
-        NSLayoutConstraint.activate([
-            card.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            card.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
-            card.topAnchor.constraint(equalTo: topAnchor, constant: 4),
-            card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
-
-            dot.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: Theme.inset),
-            dot.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-            dot.widthAnchor.constraint(equalToConstant: 11),
-            dot.heightAnchor.constraint(equalToConstant: 11),
-
-            titleLabel.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 12),
-            titleLabel.topAnchor.constraint(equalTo: card.topAnchor, constant: 13),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: pill.leadingAnchor, constant: -8),
-
-            metaLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            metaLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3),
-            metaLabel.trailingAnchor.constraint(lessThanOrEqualTo: pill.leadingAnchor, constant: -8),
-
-            pill.trailingAnchor.constraint(equalTo: chevron.leadingAnchor, constant: -8),
-            pill.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-
-            chevron.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -Theme.inset),
-            chevron.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-            chevron.widthAnchor.constraint(equalToConstant: 13),
-        ])
-
-        applyHoverStyle(animated: false)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        trackingAreas.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(
-            rect: .zero,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self))
-    }
-
-    override func mouseEntered(with event: NSEvent) { hovering = true; applyHoverStyle(animated: true) }
-    override func mouseExited(with event: NSEvent)  { hovering = false; applyHoverStyle(animated: true) }
-
-    private func applyHoverStyle(animated: Bool) {
-        card.setHover(hovering, animated: animated)
-        if animated {
-            NSAnimationContext.runAnimationGroup { ctx in ctx.duration = 0.16; chevron.animator().alphaValue = hovering ? 1 : 0 }
-        } else {
-            chevron.alphaValue = hovering ? 1 : 0
-        }
-    }
-
-    func configure(_ r: SessionRow) {
-        status = r.status
-        dot.apply(r.status)
-        card.setAccent(r.status)
-        titleLabel.stringValue = r.title
-        let lead = r.tty.isEmpty ? "" : "\(r.tty) · "
-        metaLabel.stringValue = r.status == "seen"
-            ? "\(lead)已确认"
-            : "\(lead)click → terminal"
-        pill.configure(status: r.status, text: Status.label(r.status))
-        applyHoverStyle(animated: false)
-    }
-}
-
 // MARK: - Header cell (folder group, with aggregate count badges)
 //
-// One per VSCode window that hosts >1 session. Folder name on the left, a row of
-// colored count badges on the right (●2 red / ●1 blue / ●1 green) so the whole
-// window's state reads at a glance. Click → raise the folder's window.
+// One per VSCode window. Folder name on the left, a row of colored count badges
+// on the right (●2 red / ●1 blue / ●1 green) so the whole window's state reads at
+// a glance. Click → raise the folder's window.
 
 final class HeaderCell: NSTableCellView {
     private let card = GlassCard(radius: Theme.card)
@@ -509,7 +400,6 @@ final class ChildCell: NSTableCellView {
     private let dot = StatusDot(diameter: 9)
     private let ttyLabel = NSTextField(labelWithString: "")
     private let pill = CapsuleLabel(showDot: false)
-    private let chevron = NSImageView()
 
     private var status = "idle"
     private var hovering = false
@@ -533,19 +423,13 @@ final class ChildCell: NSTableCellView {
         ttyLabel.font = Theme.font(13, .medium)
         ttyLabel.textColor = .secondaryLabelColor
         ttyLabel.lineBreakMode = .byTruncatingTail
+        // Truncate the label before the status pill is forced to shrink.
+        ttyLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         ttyLabel.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(ttyLabel)
 
         pill.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(pill)
-
-        let cfg = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
-        chevron.image = NSImage(systemSymbolName: "arrow.up.forward", accessibilityDescription: nil)?
-            .withSymbolConfiguration(cfg)
-        chevron.contentTintColor = .tertiaryLabelColor
-        chevron.alphaValue = 0
-        chevron.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(chevron)
 
         NSLayoutConstraint.activate([
             // Indented from the leading edge to nest under the header.
@@ -568,12 +452,8 @@ final class ChildCell: NSTableCellView {
             ttyLabel.centerYAnchor.constraint(equalTo: card.centerYAnchor),
             ttyLabel.trailingAnchor.constraint(lessThanOrEqualTo: pill.leadingAnchor, constant: -8),
 
-            pill.trailingAnchor.constraint(equalTo: chevron.leadingAnchor, constant: -8),
+            pill.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -Theme.inset),
             pill.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-
-            chevron.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -Theme.inset),
-            chevron.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-            chevron.widthAnchor.constraint(equalToConstant: 13),
         ])
 
         applyHoverStyle(animated: false)
@@ -594,11 +474,6 @@ final class ChildCell: NSTableCellView {
 
     private func applyHoverStyle(animated: Bool) {
         card.setHover(hovering, animated: animated)
-        if animated {
-            NSAnimationContext.runAnimationGroup { ctx in ctx.duration = 0.16; chevron.animator().alphaValue = hovering ? 1 : 0 }
-        } else {
-            chevron.alphaValue = hovering ? 1 : 0
-        }
     }
 
     func configure(_ r: SessionRow) {
@@ -606,7 +481,7 @@ final class ChildCell: NSTableCellView {
         dot.apply(r.status)
         card.setAccent(r.status)
         rail.layer?.backgroundColor = Status.accent(r.status).cgColor
-        ttyLabel.stringValue = r.tty.isEmpty ? "session" : r.tty
+        ttyLabel.stringValue = r.taskTitle.isEmpty ? "会话 \(r.seqLabel)" : r.taskTitle
         pill.configure(status: r.status, text: Status.label(r.status))
         applyHoverStyle(animated: false)
     }

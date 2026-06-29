@@ -12,30 +12,34 @@ struct SessionRow {
     let shellPid: pid_t    // parent shell pid == VSCode `terminal.processId`, used to focus
     let tty: String        // controlling tty, e.g. "ttys006" (label + disambiguation)
     let status: String     // internal: needs / working / done / seen / idle
+    let taskTitle: String  // human-readable task summary the hook derives from the user's
+                           // prompt (~/.claude/taskbeacon/title-<tty>); empty until set.
+    let seq: Int           // stable 1-based session number, for a clean "会话 01" fallback
+                           // label when there's no task title — never the bare ttysNNN.
 
     // Stable identity for ack/toast bookkeeping. shellPid (the session's parent
     // shell) is unique per live process; tty+cwd keep it stable and readable even
     // if shellPid is momentarily unavailable.
     var id: String { "tty:\(tty):\(cwd)#\(shellPid)" }
+
+    // "01", "02", … — the user-facing session number used wherever we'd otherwise
+    // have shown the ttysNNN.
+    var seqLabel: String { String(format: "%02d", seq) }
+
+    // What the list/menu shows for this row: the task summary when we have one,
+    // otherwise the folder-based title — never the bare ttysNNN.
+    var display: String { taskTitle.isEmpty ? title : taskTitle }
 }
 
 // MARK: - Status (internal taxonomy)
 //   needs   红   等你确认（ground truth from Notification hook flag file）
 //   working 蓝   正在执行（转圈圈）
 //   done    绿   跑完等输入
-//   seen    灰  done 已被点开看过，回落成灰直到该会话出现新动静（needs 不走这里，
-//               它保持红色直到 hook 反映真实确认）
+//   seen    灰  done 已被点开看过（点击跳转落到终端），回落成灰「闲置」直到该会话出现
+//               新动静（needs 不走这里，它保持红色直到 hook 反映真实确认）
 //   idle    灰白 闲置/连接中
 
 enum Status {
-    static func rank(_ s: String) -> Int {
-        switch s {
-        case "needs":   return 0
-        case "working": return 1
-        case "done":    return 2
-        default:        return 3   // seen / idle 都排最后
-        }
-    }
     static func color(_ s: String) -> NSColor {
         switch s {
         case "needs":   return .systemRed
@@ -49,8 +53,7 @@ enum Status {
         case "needs":   return "需确认"
         case "working": return "运行中"
         case "done":    return "完成"
-        case "seen":    return "已确认"
-        default:        return "闲置"
+        default:        return "闲置"   // seen / idle 都显示灰「闲置」
         }
     }
 }
@@ -218,7 +221,10 @@ final class ToastManager {
         dot.translatesAutoresizingMaskIntoConstraints = false
         iconTile.addSubview(dot)
 
-        let nameLabel = NSTextField(labelWithString: title)
+        // Cap the banner title at 16 chars + ellipsis — the toast is narrow and the
+        // task summary should read as a glance, not a paragraph.
+        let capped = title.count > 16 ? String(title.prefix(16)) + "…" : title
+        let nameLabel = NSTextField(labelWithString: capped)
         nameLabel.font = Theme.font(14.5, .semibold)
         nameLabel.textColor = .labelColor
         nameLabel.lineBreakMode = .byTruncatingTail
@@ -273,6 +279,17 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var rows: [SessionRow] = []
     private var dataTimer: Timer?
     private var animTimer: Timer?
+    // Watches the data dir so a hook writing state-<tty> refreshes the UI within
+    // tens of ms instead of waiting up to one 2.5s poll. The timer stays on as a
+    // fallback + to discover new/dead sessions (which don't touch a state file).
+    private var stateWatcher: FSEventStreamRef?
+    // A second, kernel-level watcher on the same dir. FSEvents can lag or miss an
+    // in-place file rewrite; a kqueue DispatchSource fires synchronously on the
+    // directory's vnode write (the hook now writes via atomic rename, so every state
+    // change is a dir-entry change this catches) — that's what makes the row flip the
+    // instant Claude asks instead of waiting for the 2.5s poll.
+    private var dirSource: DispatchSourceFileSystemObject?
+    private var dirFD: Int32 = -1
     // Held for the app's lifetime to opt out of App Nap. Without it, macOS
     // throttles our timers the moment we drop to the background (which happens
     // every time a click jumps focus to VSCode), freezing the spinner *and* the
@@ -290,7 +307,7 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Sessions the user has clicked-to-acknowledge: session id → the needs/done
     // status that was dismissed. While the real status stays equal to this, the
-    // row is shown gray ("已确认"); once it moves on (new work) the entry is
+    // row is shown gray ("闲置"); once it moves on (new work) the entry is
     // dropped and the real color returns. Mutated only on the main thread.
     private var acked: [String: String] = [:]
 
@@ -336,12 +353,61 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         RunLoop.main.add(at, forMode: .common)
         dataTimer = dt
         animTimer = at
+
+        startStateWatcher()
+        startDirSource()
+    }
+
+    // kqueue directory watcher — the instant path. Fires on the kernel vnode event
+    // for any dir-entry change (the hook's atomic rename), with no latency parameter
+    // to batch it. Runs alongside FSEvents as belt-and-suspenders; refresh() is
+    // idempotent so a double fire from both watchers is harmless.
+    private func startDirSource() {
+        try? FileManager.default.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
+        let fd = open(dataDir, O_EVTONLY)
+        guard fd >= 0 else { return }
+        dirFD = fd
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .extend, .rename, .delete], queue: .main)
+        src.setEventHandler { [weak self] in self?.refresh() }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        dirSource = src
+    }
+
+    // Event-driven refresh: an FSEvents stream on the data dir fires the moment a
+    // hook writes a state-<tty> file (e.g. you answer a prompt → "working"), so the
+    // UI flips immediately instead of lagging behind the 2.5s poll. Latency 0 ⇒ no
+    // batching, deliver ASAP; the kqueue dirSource backs it up for instant delivery.
+    private func startStateWatcher() {
+        try? FileManager.default.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
+        var ctx = FSEventStreamContext(
+            version: 0,
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil, release: nil, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+            guard let info = info else { return }
+            Unmanaged<AppController>.fromOpaque(info).takeUnretainedValue().refresh()
+        }
+        guard let stream = FSEventStreamCreate(
+            kCFAllocatorDefault, callback, &ctx, [dataDir] as CFArray,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.0,
+            FSEventStreamCreateFlags(
+                kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer))
+        else { return }
+        FSEventStreamSetDispatchQueue(stream, .main)
+        FSEventStreamStart(stream)
+        stateWatcher = stream
     }
 
     // MARK: Data
 
     private func refresh() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        let t0 = Date()
+        if ProcessInfo.processInfo.environment["TB_DEBUG"] != nil {
+            NSLog("TB refresh() fired")
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             let realRows = self.fetchRows()
             DispatchQueue.main.async {
@@ -351,6 +417,9 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.notifyTransitions(rows)
                 self.dismissFocusedToast()
                 self.mainWindowController?.reload(rows)
+                if ProcessInfo.processInfo.environment["TB_DEBUG"] != nil {
+                    NSLog("TB refresh() done in %.0f ms", Date().timeIntervalSince(t0) * 1000)
+                }
             }
         }
     }
@@ -366,24 +435,31 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Each process is its own row, so two AIs sharing one VSCode window show separately.
     private func fetchRows() -> [SessionRow] {
         let sessions = discoverSessions()
-        // A folder is "shared" when >1 session live in it; those rows get the tty
-        // appended to the title so they're distinguishable at a glance.
+        // A folder is "shared" when >1 session live in it; those rows get a short
+        // session number appended to the title so they're distinguishable at a glance.
         var folderCount: [String: Int] = [:]
         for s in sessions { folderCount[s.cwd, default: 0] += 1 }
+
+        // Stable 1-based number per session (ordered by parent-shell pid) so the
+        // fallback label reads "会话 01 / 02" instead of the ttysNNN device name.
+        var seqOf: [pid_t: Int] = [:]
+        for (i, pid) in sessions.map({ $0.shellPid }).sorted().enumerated() { seqOf[pid] = i + 1 }
 
         // Real status only; ack-overlay + final sort happen on the main thread.
         return sessions.map { s in
             let folder = (s.cwd as NSString).lastPathComponent
-            let dup = (folderCount[s.cwd] ?? 0) > 1 && !s.tty.isEmpty
-            let title = dup ? "\(folder) · \(s.tty)" : folder
+            let seq = seqOf[s.shellPid] ?? 0
+            let dup = (folderCount[s.cwd] ?? 0) > 1
+            let title = dup ? "\(folder) · \(String(format: "%02d", seq))" : folder
             return SessionRow(title: title, folder: folder, cwd: s.cwd,
                               shellPid: s.shellPid, tty: s.tty,
-                              status: sessionStatus(tty: s.tty))
+                              status: sessionStatus(tty: s.tty),
+                              taskTitle: sessionTitle(tty: s.tty), seq: seq)
         }
     }
 
-    // Overlay the user's acknowledgements, then sort. Runs on the main thread so
-    // `acked` is only ever touched from one queue.
+    // Overlay the user's acknowledgements, then sort into a FIXED order. Runs on the
+    // main thread so `acked` is only ever touched from one queue.
     private func applyAck(_ realRows: [SessionRow]) -> [SessionRow] {
         let live = Set(realRows.map { $0.id })
         acked = acked.filter { live.contains($0.key) }   // forget vanished sessions
@@ -392,20 +468,23 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let a = acked[r.id] {
                 if a == r.status {                        // still the acked state → gray
                     return SessionRow(title: r.title, folder: r.folder, cwd: r.cwd,
-                                      shellPid: r.shellPid, tty: r.tty, status: "seen")
+                                      shellPid: r.shellPid, tty: r.tty, status: "seen",
+                                      taskTitle: r.taskTitle, seq: r.seq)
                 }
                 acked.removeValue(forKey: r.id)           // moved on → real color returns
             }
             return r
         }
+        // Position is FIXED: rows sort by a stable key (folder, then session number),
+        // never by status. A status change only recolors a row in place — it never
+        // makes the row jump to a new position.
         rows.sort {
-            let r0 = Status.rank($0.status), r1 = Status.rank($1.status)
-            return r0 != r1 ? r0 < r1 : $0.title < $1.title
+            $0.cwd != $1.cwd ? $0.cwd < $1.cwd : $0.seq < $1.seq
         }
         return rows
     }
 
-    // Mark a `done` session seen, so its row greys to "已确认" until new work arrives.
+    // Mark a `done` session seen, so its row greys to "闲置" until new work arrives.
     // The ONLY trigger is the companion extension reporting you actually focused that
     // terminal (via dismissFocusedToast) — never a mere click on the toast/row/menu.
     // `done` has no ground-truth "seen" signal of its own, so this focus-driven ack
@@ -414,7 +493,7 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // `needs` is deliberately NOT ack-able: focusing the terminal isn't answering the
     // prompt. It stays red until you actually respond and the hook flips the state
     // (working/done) — the authoritative signal. Graying it on anything less would
-    // misreport "已确认" before you'd confirmed anything.
+    // misreport "闲置" before you'd confirmed anything.
     private func acknowledge(_ id: String, status: String) {
         guard status == "done" else { return }
         acked[id] = status
@@ -540,12 +619,21 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // The task summary the hook derived from the session's latest prompt
+    // (~/.claude/taskbeacon/title-<tty>). Empty when no prompt has been seen yet —
+    // callers fall back to the folder/tty label.
+    private func sessionTitle(tty: String) -> String {
+        guard !tty.isEmpty else { return "" }
+        return (try? String(contentsOfFile: "\(dataDir)/title-\(tty)", encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
     // Fire a toast whenever a session newly enters needs/done.
     private func notifyTransitions(_ newRows: [SessionRow]) {
         if primed {
             for row in newRows where row.status == "needs" || row.status == "done" {
                 if lastStatus[row.id] != row.status {
-                    ToastManager.shared.show(title: row.title, status: row.status, path: row.id) { [weak self] in
+                    ToastManager.shared.show(title: row.display, status: row.status, path: row.id) { [weak self] in
                         self?.focus(row)
                     }
                 }
@@ -574,7 +662,7 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let m = NSMutableAttributedString()
         m.append(NSAttributedString(string: glyph(row.status) + "  ",
                                     attributes: [.foregroundColor: Status.color(row.status), .font: menuFont]))
-        m.append(NSAttributedString(string: row.title,
+        m.append(NSAttributedString(string: row.display,
                                     attributes: [.font: menuFont]))
         return m
     }
@@ -732,7 +820,9 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // forward (the multi-monitor jump bug). The Accessibility API raises the exact
     // window regardless of which app/window is currently frontmost, across displays
     // and Spaces. We match the window by its title, which carries the workspace
-    // folder name. Falls back to `open` when AX isn't granted or no window matches.
+    // folder name (matched against cwd and its ancestors). `open` is used only when
+    // AX isn't granted; when AX is granted we never `open <cwd>`, to avoid spawning a
+    // spurious new window for a subdir whose workspace window already exists.
     private func raiseVSCodeWindow(cwd: String) {
         guard AXIsProcessTrusted(),
               let app = NSRunningApplication.runningApplications(
@@ -748,17 +838,35 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             run("/usr/bin/open", ["-b", "com.microsoft.VSCode", cwd])
             return
         }
-        let target = URL(fileURLWithPath: cwd).lastPathComponent
-        for win in windows {
+        // Snapshot each window's title once.
+        let titled: [(win: AXUIElement, title: String)] = windows.compactMap { win in
             var titleRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
-                  let title = titleRef as? String, title.contains(target) else { continue }
-            AXUIElementPerformAction(win, kAXRaiseAction as CFString)
-            app.activate(options: [])   // window already ordered front by the raise
-            return
+                  let title = titleRef as? String else { return nil }
+            return (win, title)
         }
-        // Folder not open in any window — let `open` create/raise it.
-        run("/usr/bin/open", ["-b", "com.microsoft.VSCode", cwd])
+        // The window title carries the WORKSPACE root's name, which is often an
+        // ANCESTOR of the session's cwd (you opened ~/proj, the terminal cd'd into
+        // ~/proj/src). Matching only cwd's leaf folder misses that window, and the
+        // `open <cwd>` fallback would then spawn a brand-new window rooted at the
+        // subdir — that's the "随机弹出新窗口" bug. So walk cwd's path components from
+        // the deepest up to (but not including) the home dir and raise the first
+        // window whose title matches; deepest-first prefers the most specific window.
+        let home = NSHomeDirectory()
+        var dir = cwd
+        while dir.count > home.count && dir != "/" {
+            let name = (dir as NSString).lastPathComponent
+            if let match = titled.first(where: { $0.title.contains(name) }) {
+                AXUIElementPerformAction(match.win, kAXRaiseAction as CFString)
+                app.activate(options: [])   // window already ordered front by the raise
+                return
+            }
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+        // No open window matches any ancestor. Just bring VSCode forward — never
+        // `open <cwd>`: a live session's window already exists, and opening the cwd
+        // would create a spurious new window for what is usually a subdir.
+        app.activate(options: [])
     }
 
     // Accessibility is the one permission this app needs: raiseVSCodeWindow uses

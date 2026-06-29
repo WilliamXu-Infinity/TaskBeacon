@@ -100,6 +100,12 @@ async function focusByPid(pid) {
     }
     if (tpid === pid) {
       term.show(false); // preserveFocus=false → terminal takes keyboard focus
+      // Report the focus directly rather than relying on onDidChangeActiveTerminal:
+      // when this terminal is ALREADY the window's active terminal (the common case —
+      // you were just there, or it's the only terminal), term.show() fires no change
+      // event, so the app would never learn the session was focused and a "done" row
+      // would stay green forever. A direct write (fresh nonce) always reaches the app.
+      reportActiveTerminal(term);
       return;
     }
   }
