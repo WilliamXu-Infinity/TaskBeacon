@@ -77,13 +77,20 @@ fi
 # is what made the red "needs" lag behind the actual prompt.
 state="$action"
 if [ "$action" = "needs" ]; then
-  # Only a permission/confirmation notification is red; the idle "waiting for your
-  # input" notification means the turn is over → done. grep -i keeps this off the
-  # python path so the latency-critical "needs" write isn't delayed by a cold start.
-  if printf '%s' "$input" | grep -qi "waiting for your input"; then
-    state="done"
-  else
+  # A Notification fires for two unrelated things: (1) Claude needs you to
+  # confirm/approve something — "needs your permission" (tool) or "needs your
+  # approval for the plan / a review artifact" — that's the ONLY red 需确认 case;
+  # and (2) it's simply your turn to type — "is waiting for your input" or "needs
+  # your input" — the turn is over → done 绿. Match the confirm case explicitly and
+  # default everything else to done. The old test was inverted (anything that
+  # wasn't "waiting for your input" => needs), so a plain "needs your input" idle
+  # ping painted a just-finished session red and showed a phantom "需确认" the user
+  # never had to confirm. grep -i keeps this off the python path so the
+  # latency-critical "needs" write isn't delayed by a cold start.
+  if printf '%s' "$input" | grep -qiE 'needs your (permission|approval)'; then
     state="needs"
+  else
+    state="done"
   fi
 elif [ "$action" = "working" ]; then
   # PreToolUse for a tool that STOPS and waits on you — AskUserQuestion (confirm a

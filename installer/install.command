@@ -66,6 +66,10 @@ WIRING = {
     "Notification":     "needs",
     "UserPromptSubmit": "working",
     "PreToolUse":       "working",
+    # PostToolUse flips needs -> working the instant you answer an
+    # AskUserQuestion / ExitPlanMode (or approve a permission prompt), so the
+    # "需确认" banner clears on confirm instead of lingering until the next turn.
+    "PostToolUse":      "working",
 }
 CMD = "~/.claude/hooks/taskbeacon-status.sh"
 

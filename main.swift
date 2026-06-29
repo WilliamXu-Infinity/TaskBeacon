@@ -66,6 +66,15 @@ enum Status {
 
 final class ClickableEffectView: NSVisualEffectView {
     var onClick: (() -> Void)?
+    // The specular sheen must always span the full card width. AppKit resizes the
+    // content view once it's installed in the panel, so a sheen pinned to the
+    // construction-time bounds can fall short of an edge and read as a hard "the
+    // highlight stops partway across" seam — keep it matched to our live bounds.
+    weak var sheen: CAGradientLayer?
+    override func layout() {
+        super.layout()
+        sheen?.frame = bounds
+    }
     override func mouseDown(with event: NSEvent) { onClick?() }
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .pointingHand)
@@ -137,6 +146,14 @@ final class ToastManager {
         for path in toasts.map({ $0.path }) where path.hasSuffix(suffix) { dismiss(path) }
     }
 
+    // Dismiss any toast whose owning session is no longer live. A "needs" toast
+    // never auto-times-out (you must not miss it), so without this it outlives a
+    // session that ended — or changed identity — while still awaiting confirmation,
+    // leaving a "需确认" banner stranded on screen forever after the work is gone.
+    func retain(liveIds: Set<String>) {
+        for path in toasts.map({ $0.path }) where !liveIds.contains(path) { dismiss(path) }
+    }
+
     func dismiss(_ path: String) {
         guard let idx = toasts.firstIndex(where: { $0.path == path }) else { return }
         let panel = toasts.remove(at: idx).panel
@@ -190,6 +207,11 @@ final class ToastManager {
         effect.layer?.borderColor = Theme.hairline.cg(in: effect)
         effect.layer?.masksToBounds = true
         effect.onClick = onClick
+        // Uniform frosted fill — same tile the window cards use. Without it the toast
+        // is just bare .hudWindow blur, so the wallpaper's own light/dark variation
+        // bleeds through unevenly and reads as "the white stops on one side". The
+        // fill gives every toast a consistent base regardless of what's behind it.
+        effect.layer?.backgroundColor = Theme.cardFill.cg(in: effect)
 
         // Specular top-edge sheen — same glass-thickness cue as the window cards,
         // so a toast reads as the same material floating free.
@@ -203,6 +225,7 @@ final class ToastManager {
         // would interpolate through grey and paint a dark band at the fade).
         sheen.colors = [Theme.sheen.cg(in: effect), NSColor.white.withAlphaComponent(0).cgColor]
         effect.layer?.addSublayer(sheen)
+        effect.sheen = sheen
 
         // Left "app icon" tile — a tinted rounded square holding the glowing dot.
         // This left-aligned icon block is what reads as an Apple notification.
@@ -646,6 +669,10 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for row in newRows where row.status != "needs" && row.status != "done" {
             ToastManager.shared.dismiss(row.id)
         }
+        // Sweep orphaned toasts: a session that ended (or changed identity) while
+        // "needs" left no row above to clear it, so clear it by absence here — newRows
+        // is the full live set, so any toast whose path isn't in it is dead work.
+        ToastManager.shared.retain(liveIds: Set(newRows.map { $0.id }))
         // Defensive merge: ids are unique by shellPid, but never let a stray
         // collision trap the whole app.
         lastStatus = Dictionary(newRows.map { ($0.id, $0.status) }, uniquingKeysWith: { _, new in new })
@@ -812,61 +839,182 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         raiseVSCodeWindow(cwd: cwd)
     }
 
-    // Bring the VSCode window that owns `cwd` to the front — even when VSCode is
-    // ALREADY the frontmost app (e.g. you're sitting in another VSCode window on a
-    // second monitor). `open -b <bundle> <cwd>` only raises the window when VSCode
-    // is NOT frontmost: LaunchServices treats an already-active app whose folder is
-    // already open as "nothing to do" and no-ops, so the target window never comes
-    // forward (the multi-monitor jump bug). The Accessibility API raises the exact
-    // window regardless of which app/window is currently frontmost, across displays
-    // and Spaces. We match the window by its title, which carries the workspace
-    // folder name (matched against cwd and its ancestors). `open` is used only when
-    // AX isn't granted; when AX is granted we never `open <cwd>`, to avoid spawning a
-    // spurious new window for a subdir whose workspace window already exists.
+    // Bring the VSCode window that owns `cwd` to the front — across desktops/displays.
+    //
+    // Each VSCode window can live on its own macOS Space (a Mission Control desktop, or
+    // a display when "Displays have separate Spaces" is on). The Accessibility API's
+    // window list (kAXWindowsAttribute) only enumerates windows on the CURRENT Space,
+    // so it literally cannot see — let alone raise — a window sitting on another
+    // desktop: that was the multi-window jump bug. CGWindowList, by contrast, sees
+    // every window on every Space.
+    //
+    // So: find the target window via CGWindowList (matched by title, which carries the
+    // workspace folder name), look up its Space with the private CGS API, switch to
+    // that Space, then activate VSCode so the now-current-Space window comes forward.
+    // Reading window TITLES from CGWindowList needs Screen Recording permission; without
+    // it titles come back empty, so we prompt once and fall back to a plain activate.
     private func raiseVSCodeWindow(cwd: String) {
-        guard AXIsProcessTrusted(),
-              let app = NSRunningApplication.runningApplications(
+        guard let app = NSRunningApplication.runningApplications(
                   withBundleIdentifier: "com.microsoft.VSCode").first else {
-            requestAccessibilityIfNeeded()
             run("/usr/bin/open", ["-b", "com.microsoft.VSCode", cwd])
             return
         }
-        let appEl = AXUIElementCreateApplication(app.processIdentifier)
-        var windowsRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-              let windows = windowsRef as? [AXUIElement] else {
-            run("/usr/bin/open", ["-b", "com.microsoft.VSCode", cwd])
+        let pid = app.processIdentifier
+
+        // All of VSCode's top-level (layer 0) windows, across every Space.
+        let info = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+        let titled: [(wid: CGWindowID, title: String)] = info.compactMap { w in
+            guard (w[kCGWindowOwnerPID as String] as? pid_t) == pid,
+                  (w[kCGWindowLayer as String] as? Int) == 0,
+                  let wid = w[kCGWindowNumber as String] as? CGWindowID,
+                  let title = w[kCGWindowName as String] as? String, !title.isEmpty
+            else { return nil }
+            return (wid, title)
+        }
+
+        // No titles → almost certainly missing Screen Recording permission (CGWindowList
+        // withholds window names otherwise). Can't map cwd→window; prompt once, activate.
+        if titled.isEmpty {
+            requestScreenRecordingIfNeeded()
+            app.activate(options: [])
             return
         }
-        // Snapshot each window's title once.
-        let titled: [(win: AXUIElement, title: String)] = windows.compactMap { win in
-            var titleRef: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
-                  let title = titleRef as? String else { return nil }
-            return (win, title)
-        }
-        // The window title carries the WORKSPACE root's name, which is often an
-        // ANCESTOR of the session's cwd (you opened ~/proj, the terminal cd'd into
-        // ~/proj/src). Matching only cwd's leaf folder misses that window, and the
-        // `open <cwd>` fallback would then spawn a brand-new window rooted at the
-        // subdir — that's the "随机弹出新窗口" bug. So walk cwd's path components from
-        // the deepest up to (but not including) the home dir and raise the first
-        // window whose title matches; deepest-first prefers the most specific window.
+
+        // cwd path components, deepest first (deepest-first prefers the most specific
+        // window when a session's cwd nests under an opened parent workspace).
         let home = NSHomeDirectory()
+        var components: [String] = []
         var dir = cwd
         while dir.count > home.count && dir != "/" {
-            let name = (dir as NSString).lastPathComponent
-            if let match = titled.first(where: { $0.title.contains(name) }) {
-                AXUIElementPerformAction(match.win, kAXRaiseAction as CFString)
-                app.activate(options: [])   // window already ordered front by the raise
-                return
-            }
+            components.append((dir as NSString).lastPathComponent)
             dir = (dir as NSString).deletingLastPathComponent
         }
-        // No open window matches any ancestor. Just bring VSCode forward — never
-        // `open <cwd>`: a live session's window already exists, and opening the cwd
-        // would create a spurious new window for what is usually a subdir.
+
+        // VSCode titles look like "file.ext — RootName — Visual Studio Code", joined by
+        // the title separator (default em-dash, customizable to "-"/"|"). Split a title
+        // into its segments so we can compare the workspace-root segment to a folder
+        // name EXACTLY. A loose substring test mis-fires: a generic subdir like "web" is
+        // a substring of another project's title "web-dashboard". Exact-segment match
+        // skips that false hit and keeps walking up to the real root ("myapp"). We split
+        // only on whole separators (em/en-dash, pipe) — never bare "-", which appears
+        // inside folder names like "vscode-extension" — and also treat the whole trimmed
+        // title as one segment so plain single-folder titles ("myapp") still match.
+        func segments(of title: String) -> [String] {
+            var segs = title.components(separatedBy: CharacterSet(charactersIn: "—–|"))
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            segs.append(title.trimmingCharacters(in: .whitespaces))
+            return segs.filter { !$0.isEmpty }
+        }
+
+        // Pass 1 exact segment, Pass 2 loose substring fallback (decorated titles).
+        var target: CGWindowID?
+        for name in components where target == nil {
+            target = titled.first(where: { segments(of: $0.title).contains(name) })?.wid
+        }
+        for name in components where target == nil {
+            target = titled.first(where: { $0.title.contains(name) })?.wid
+        }
+        guard let wid = target else {
+            app.activate(options: [])
+            return
+        }
+
+        // Switch to the window's Space, then activate VSCode — the window is now on the
+        // current Space and becomes key. (Each Space holds one VSCode window here.)
+        switchToSpace(of: wid)
         app.activate(options: [])
+    }
+
+    // MARK: Private CGS — cross-Space window control
+    //
+    // SkyLight/CoreGraphics has long-stable private symbols for reading a window's Space
+    // and switching the active Space (the same ones yabai/AltTab use). We resolve them
+    // by name at runtime; if any is missing on a future macOS, switchToSpace just no-ops
+    // and the jump degrades to a plain activate rather than crashing.
+    private typealias CGSIntFn = @convention(c) () -> Int32
+    private typealias CGSDispForWinFn = @convention(c) (Int32, CGWindowID) -> Unmanaged<CFString>?
+    private typealias CGSSpacesFn = @convention(c) (Int32, UInt32, CFArray) -> Unmanaged<CFArray>?
+    private typealias CGSSetSpaceFn = @convention(c) (Int32, CFString, UInt64) -> Void
+
+    private lazy var cgHandle = dlopen(
+        "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_NOW)
+    private lazy var cgsConn: Int32 = {
+        guard let h = cgHandle, let s = dlsym(h, "CGSMainConnectionID") else { return 0 }
+        return unsafeBitCast(s, to: CGSIntFn.self)()
+    }()
+
+    private func switchToSpace(of wid: CGWindowID) {
+        guard let h = cgHandle, cgsConn != 0,
+              let dispSym = dlsym(h, "CGSCopyManagedDisplayForWindow"),
+              let spacesSym = dlsym(h, "CGSCopySpacesForWindows"),
+              let setSym = dlsym(h, "CGSManagedDisplaySetCurrentSpace") else { return }
+        let dispForWin = unsafeBitCast(dispSym, to: CGSDispForWinFn.self)
+        let copySpaces = unsafeBitCast(spacesSym, to: CGSSpacesFn.self)
+        let setSpace = unsafeBitCast(setSym, to: CGSSetSpaceFn.self)
+        // 0x7 = all space types (user + fullscreen + system).
+        guard let disp = dispForWin(cgsConn, wid)?.takeRetainedValue(),
+              let spaces = copySpaces(cgsConn, 0x7, [wid] as CFArray)?.takeRetainedValue() as? [UInt64],
+              let space = spaces.first else { return }
+        setSpace(cgsConn, disp, space)
+    }
+
+    // Screen Recording is what lets CGWindowList expose window TITLES, which we match
+    // cwd against. Prompt at most once; the system dialog + deep link route the user to
+    // the toggle. Until granted, jumps fall back to a plain VSCode activate.
+    private var promptedForScreenRecording = false
+    private func requestScreenRecordingIfNeeded() {
+        guard !promptedForScreenRecording else { return }
+        promptedForScreenRecording = true
+        guard !CGPreflightScreenCaptureAccess() else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "需要开启「屏幕录制」权限"
+        alert.informativeText = """
+            点击会话要跳到对应的 VSCode 窗口，而多个窗口分布在不同桌面 Space / 显示器时，\
+            唯一能区分它们的就是「窗口标题」（标题里带 workspace 文件夹名）。
+
+            macOS 把「读取其它 App 的窗口标题」归在「屏幕录制」权限之下，所以必须开启它，\
+            TaskBeacon 才能读到标题、定位到你点的那个窗口。
+
+            ✅ 不受影响：状态监控、通知横幅、提示音照常工作。
+            开启：系统设置 → 隐私与安全性 → 屏幕录制 → 打开 TaskBeacon（之后需重启本 App）。
+            """
+
+        // Red, bold reassurance — the permission is named "Screen Recording" but we only
+        // read window-title text, never capture any pixels. Make that unmistakable.
+        let note = NSTextField(wrappingLabelWithString: "")
+        let body: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12),
+            .foregroundColor: NSColor.systemRed,
+        ]
+        let bold: [NSAttributedString.Key: Any] = [
+            .font: NSFont.boldSystemFont(ofSize: 12),
+            .foregroundColor: NSColor.systemRed,
+        ]
+        let s = NSMutableAttributedString()
+        s.append(NSAttributedString(string: "⚠️ TaskBeacon 绝不会截屏或录制你的屏幕。\n", attributes: bold))
+        s.append(NSAttributedString(
+            string: "这个权限名字叫「屏幕录制」只是因为 Apple 把『读取窗口标题』和『截屏』放在了同一个开关后面。"
+                  + "本 App 仅用它读取各 VSCode 窗口的标题文字，用来确认你点击的会话对应哪个窗口 —— "
+                  + "不采集、不上传、不保存任何屏幕画面。",
+            attributes: body))
+        note.attributedStringValue = s
+        note.isEditable = false
+        note.isBordered = false
+        note.drawsBackground = false
+        note.preferredMaxLayoutWidth = 360
+        note.frame = NSRect(x: 0, y: 0, width: 360,
+                            height: note.sizeThatFits(NSSize(width: 360, height: 0)).height)
+        alert.accessoryView = note
+
+        alert.addButton(withTitle: "打开屏幕录制设置")
+        alert.addButton(withTitle: "稍后")
+        let open = alert.runModal() == .alertFirstButtonReturn
+        CGRequestScreenCaptureAccess()
+        if open, let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // Accessibility is the one permission this app needs: raiseVSCodeWindow uses
