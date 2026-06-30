@@ -13,7 +13,7 @@ import Cocoa
 // badges) followed by one indented child per terminal. A lone session is just a
 // header with a single child — keeps the layout uniform.
 fileprivate enum DisplayItem {
-    case header(folder: String, cwd: String, counts: [(String, Int)])
+    case header(folder: String, cwd: String, counts: [(String, Int)], collapsed: Bool)
     case child(SessionRow)                                        // session under a header
 }
 
@@ -21,6 +21,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     private var rows: [SessionRow] = []
     private var items: [DisplayItem] = []
+    private var collapsed: Set<String> = []      // cwds whose children are hidden
+    private var lastToggledCwd: String?          // header just toggled by a single click (undone if a double-click follows)
     var onJump: ((SessionRow) -> Void)?
     var onJumpFolder: ((String) -> Void)?
     var onRefresh: (() -> Void)?
@@ -126,6 +128,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         tableView.delegate = self
         tableView.target = self
         tableView.action = #selector(rowClicked)
+        tableView.doubleAction = #selector(rowDoubleClicked)
         scroll.documentView = tableView
         glass.addSubview(scroll)
 
@@ -164,7 +167,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     func reload(_ newRows: [SessionRow]) {
         rows = newRows
-        items = MainWindowController.group(newRows)
+        items = group(newRows)
         summaryLabel.stringValue = rows.isEmpty
             ? "—"
             : "\(rows.count) session\(rows.count == 1 ? "" : "s")"
@@ -185,7 +188,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     // Group the (already stably-sorted) rows by folder. Folder order is FIXED —
     // alphabetical by cwd — so groups never float on a status change; within a group
     // the rows keep their incoming (session-number) order. Status only recolors.
-    private static func group(_ rows: [SessionRow]) -> [DisplayItem] {
+    private func group(_ rows: [SessionRow]) -> [DisplayItem] {
         var groups: [String: [SessionRow]] = [:]
         for r in rows { groups[r.cwd, default: []].append(r) }
         let keys = groups.keys.sorted()
@@ -193,8 +196,9 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         for key in keys {
             let g = groups[key]!
             let folder = (key as NSString).lastPathComponent
-            out.append(.header(folder: folder, cwd: key, counts: counts(g)))
-            for s in g { out.append(.child(s)) }
+            let isCollapsed = collapsed.contains(key)
+            out.append(.header(folder: folder, cwd: key, counts: Self.counts(g), collapsed: isCollapsed))
+            if !isCollapsed { for s in g { out.append(.child(s)) } }
         }
         return out
     }
@@ -225,10 +229,10 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         switch items[row] {
-        case .header(let folder, _, let counts):
+        case .header(let folder, _, let counts, let collapsed):
             let id = NSUserInterfaceItemIdentifier("header")
             let cell = (tableView.makeView(withIdentifier: id, owner: self) as? HeaderCell) ?? HeaderCell(id: id)
-            cell.configure(folder: folder, counts: counts)
+            cell.configure(folder: folder, counts: counts, collapsed: collapsed)
             return cell
         case .child(let r):
             let id = NSUserInterfaceItemIdentifier("child")
@@ -275,16 +279,41 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     // (reported by the companion extension) for `done`, or the hook clearing `needs`
     // once you really answer the prompt. Optimistically graying on click misreported
     // state ("闲置" before you'd answered anything).
-    // A header click only raises the folder's window (no single terminal to focus).
+    //
+    // A header distinguishes single vs double click: single click toggles the
+    // folder's collapse state, double click jumps to (raises) the folder's window.
+    // The single click acts immediately (no laggy double-click-interval wait); AppKit
+    // fires it on the first mouseUp of a double click too, so rowDoubleClicked undoes
+    // that toggle before jumping — net effect of a double click is just the jump.
     @objc private func rowClicked() {
         let r = tableView.clickedRow
         guard r >= 0 && r < items.count else { return }
         switch items[r] {
         case .child(let row):
             onJump?(row)
-        case .header(_, let cwd, _):
+        case .header(_, let cwd, _, _):
+            toggleCollapse(cwd)
+            lastToggledCwd = cwd
+        }
+    }
+
+    // Double click on a header → undo the toggle the preceding single click just made,
+    // then jump to the folder's window. (Children jump on single click; a double click
+    // there is a harmless no-op here.)
+    @objc private func rowDoubleClicked() {
+        let r = tableView.clickedRow
+        guard r >= 0 && r < items.count else { return }
+        if case .header(_, let cwd, _, _) = items[r] {
+            if let last = lastToggledCwd { toggleCollapse(last) }
             onJumpFolder?(cwd)
         }
+    }
+
+    private func toggleCollapse(_ cwd: String) {
+        lastToggledCwd = nil
+        if collapsed.contains(cwd) { collapsed.remove(cwd) } else { collapsed.insert(cwd) }
+        items = group(rows)
+        tableView.reloadData()
     }
 }
 
@@ -314,6 +343,7 @@ final class TransparentRowView: NSTableRowView {
 
 final class HeaderCell: NSTableCellView {
     private let card = GlassCard(radius: Theme.card)
+    private let chevron = NSImageView()
     private let folderLabel = NSTextField(labelWithString: "")
     private let badgeStack = NSStackView()
     private var badges: [CapsuleLabel] = []
@@ -325,6 +355,11 @@ final class HeaderCell: NSTableCellView {
 
         card.translatesAutoresizingMaskIntoConstraints = false
         addSubview(card)
+
+        // Disclosure chevron: ▸ collapsed, ▾ expanded. Click the header to toggle.
+        chevron.contentTintColor = .secondaryLabelColor
+        chevron.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(chevron)
 
         folderLabel.font = Theme.rounded(14.5, .bold)
         folderLabel.textColor = .labelColor
@@ -343,7 +378,11 @@ final class HeaderCell: NSTableCellView {
             card.topAnchor.constraint(equalTo: topAnchor, constant: 4),
             card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
 
-            folderLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: Theme.inset),
+            chevron.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: Theme.inset),
+            chevron.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            chevron.widthAnchor.constraint(equalToConstant: 11),
+
+            folderLabel.leadingAnchor.constraint(equalTo: chevron.trailingAnchor, constant: 8),
             folderLabel.centerYAnchor.constraint(equalTo: card.centerYAnchor),
             folderLabel.trailingAnchor.constraint(lessThanOrEqualTo: badgeStack.leadingAnchor, constant: -8),
 
@@ -371,8 +410,11 @@ final class HeaderCell: NSTableCellView {
         card.setHover(hovering, animated: animated)
     }
 
-    func configure(folder: String, counts: [(String, Int)]) {
+    func configure(folder: String, counts: [(String, Int)], collapsed: Bool) {
         folderLabel.stringValue = folder
+        let cfg = NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
+        chevron.image = NSImage(systemSymbolName: collapsed ? "chevron.right" : "chevron.down",
+                                accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
         card.setAccent(counts.first?.0 ?? "idle")
 
         // Rebuild the badges to match this folder's nonzero buckets.

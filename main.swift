@@ -309,9 +309,14 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var rows: [SessionRow] = []
     private var dataTimer: Timer?
     private var animTimer: Timer?
-    // Monotonic refresh stamp: the latest dispatched refresh wins, stale snapshots from
-    // overlapping concurrent scans are dropped (see refresh()). Touched only on main.
+    // Monotonic refresh stamp + serial scan queue: every refresh() bumps the stamp and
+    // enqueues its scan on `scanQueue`. Serial = scans run in dispatch order, so the
+    // highest-stamp scan also reads the freshest state files; a stale snapshot can neither
+    // be produced (in-order reads) nor applied (the stamp guard drops it). A concurrent
+    // queue couldn't promise that — a later-stamped scan could read older files and still
+    // win, which is what left the residual twitch. The stamp is touched only on main.
     private var refreshGen = 0
+    private let scanQueue = DispatchQueue(label: "com.taskbeacon.scan", qos: .userInitiated)
     // Watches the data dir so a hook writing state-<tty> refreshes the UI within
     // tens of ms instead of waiting up to one 2.5s poll. The timer stays on as a
     // fallback + to discover new/dead sessions (which don't touch a state file).
@@ -441,17 +446,22 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSLog("TB refresh() fired")
         }
         // Three sources drive refresh() — the 2.5s dataTimer, the FSEvents stream, and
-        // the kqueue dirSource — all on the main thread. Each hands the (variable-length)
-        // process scan to a CONCURRENT global queue, so overlapping refreshes can finish
-        // OUT OF ORDER: an older snapshot, started before a state file changed, can land
-        // on the main thread AFTER a newer one and overwrite fresh state with stale —
-        // flashing a row back to its previous color for a frame (the periodic needs→done→
-        // needs / idle→needs→idle twitch). Stamp each refresh with a generation and drop
-        // any snapshot that a newer refresh has already superseded — only the latest wins.
+        // the kqueue dirSource — all on the main thread. Each bumps refreshGen and hands
+        // the (variable-length) process scan to the SERIAL scanQueue. Two guards then keep
+        // exactly one scan meaningful: the head guard skips the expensive scan outright when
+        // a newer refresh has already been queued (burst coalescing — a flurry of FSEvents
+        // during an active turn collapses to a single real scan), and the tail guard drops
+        // any snapshot a newer refresh superseded. Serial ordering means the surviving
+        // (latest) scan also read the freshest state files, so a row can no longer flash
+        // back a frame to a stale color (the needs→done→needs / idle→needs→idle twitch).
         refreshGen &+= 1
         let gen = refreshGen
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        scanQueue.async { [weak self] in
             guard let self = self else { return }
+            // Burst coalescing: bail before the scan if a newer refresh already superseded
+            // us. Reading refreshGen on main keeps it single-threaded; scanQueue→main.sync
+            // can't deadlock (the main thread never waits back on scanQueue).
+            if DispatchQueue.main.sync(execute: { gen != self.refreshGen }) { return }
             let realRows = self.fetchRows()
             DispatchQueue.main.async {
                 guard gen == self.refreshGen else { return }
