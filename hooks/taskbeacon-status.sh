@@ -9,8 +9,13 @@
 # transitions we care about:
 #   $1 = working -> UserPromptSubmit / PreToolUse  (model is busy)        蓝
 #   $1 = done    -> Stop                           (turn ended, your turn) 绿
-#   $1 = needs   -> Notification                   (permission prompt)     红
-#                   the idle "waiting for your input" notification is just done.
+#   $1 = needs   -> PermissionRequest              (permission dialog)     红
+#                   PermissionRequest fires the instant the dialog appears — the
+#                   real-time needs signal. Notification is ALSO mapped to "needs"
+#                   as a fallback, but Claude Code debounces it (~2-4s lag), and it
+#                   double-duties as the idle "waiting for your input" ping, which is
+#                   NOT done: it fires while a session merely sits waiting, so it must
+#                   not repaint an idle row green 完成 — Stop already owns "done".
 #
 # State is keyed by the session's controlling tty, not env: both CLAUDE_CODE_SESSION_ID
 # and CLAUDE_CODE_SSE_PORT are inherited and shared by every terminal in the same
@@ -77,21 +82,32 @@ fi
 # is what made the red "needs" lag behind the actual prompt.
 state="$action"
 if [ "$action" = "needs" ]; then
-  # A Notification fires for two unrelated things: (1) Claude needs you to
-  # confirm/approve something — "needs your permission" (tool) or "needs your
-  # approval for the plan / a review artifact" — that's the ONLY red 需确认 case;
-  # and (2) it's simply your turn to type — "is waiting for your input" or "needs
-  # your input" — the turn is over → done 绿. Match the confirm case explicitly and
-  # default everything else to done. The old test was inverted (anything that
-  # wasn't "waiting for your input" => needs), so a plain "needs your input" idle
-  # ping painted a just-finished session red and showed a phantom "需确认" the user
-  # never had to confirm. grep -i keeps this off the python path so the
-  # latency-critical "needs" write isn't delayed by a cold start.
-  if printf '%s' "$input" | grep -qiE 'needs your (permission|approval)'; then
-    state="needs"
-  else
-    state="done"
-  fi
+  # Two events map to this action, and they differ in latency by SECONDS:
+  #
+  #   PermissionRequest — fires the instant the permission dialog appears. This is
+  #     the real-time, ground-truth "needs" signal and the one we prefer. Its payload
+  #     carries no .message to grep; by definition it IS a permission request, so flip
+  #     to needs (红) unconditionally. Fast `case` match on the raw payload — no python,
+  #     no grep, on this latency-critical path.
+  #
+  #   Notification — Claude Code DEBOUNCES this (it lags the on-screen prompt by ~2-4s),
+  #     so it's only a FALLBACK for older Claude Code that lacks PermissionRequest. It
+  #     also double-duties as the idle "waiting for your input" ping, which is NOT a
+  #     completion: it fires while a session merely sits idle, so writing "done" here
+  #     would repaint a quiet row green 完成 out of nowhere (the "闲置突然变绿" bug).
+  #     Stop already owns "done", so on the idle ping we preserve the current state and
+  #     exit before the state write below. Only an explicit permission/approval message
+  #     becomes needs.
+  case "$input" in
+    *'"hook_event_name":"PermissionRequest"'*|*'"hook_event_name": "PermissionRequest"'*)
+      state="needs" ;;
+    *)
+      if printf '%s' "$input" | grep -qiE 'needs your (permission|approval)'; then
+        state="needs"
+      else
+        exit 0
+      fi ;;
+  esac
 elif [ "$action" = "working" ]; then
   # PreToolUse for a tool that STOPS and waits on you — AskUserQuestion (confirm a
   # direction) or ExitPlanMode (approve a plan) — means it's your turn the instant the

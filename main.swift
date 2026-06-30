@@ -2,6 +2,13 @@ import Cocoa
 import Darwin
 import ApplicationServices
 
+// GetProcessForPID is marked unavailable in the Swift overlay (deprecated since 10.9),
+// but the C symbol is still exported by HIServices and remains the only way to turn a
+// pid into the ProcessSerialNumber that SkyLight's focus API wants. Bind it directly.
+@_silgen_name("GetProcessForPID")
+private func _GetProcessForPID(
+    _ pid: pid_t, _ psn: UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
+
 // One row in the menu = one live Claude session (one interactive `claude`
 // process). Two sessions in the same VSCode window become two rows.
 struct SessionRow {
@@ -130,7 +137,7 @@ final class ToastManager {
 
         // "needs" (red, awaiting your input) is the one you must not miss, so it
         // stays put until clicked (or the terminal is focused → dismiss(shellPid:)).
-        // Everything else (done) is informational and auto-dismisses.
+        // Any other (informational) status auto-dismisses after its lifetime.
         if status != "needs" {
             DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { [weak self] in
                 self?.dismiss(path)
@@ -302,6 +309,9 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var rows: [SessionRow] = []
     private var dataTimer: Timer?
     private var animTimer: Timer?
+    // Monotonic refresh stamp: the latest dispatched refresh wins, stale snapshots from
+    // overlapping concurrent scans are dropped (see refresh()). Touched only on main.
+    private var refreshGen = 0
     // Watches the data dir so a hook writing state-<tty> refreshes the UI within
     // tens of ms instead of waiting up to one 2.5s poll. The timer stays on as a
     // fallback + to discover new/dead sessions (which don't touch a state file).
@@ -430,10 +440,21 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if ProcessInfo.processInfo.environment["TB_DEBUG"] != nil {
             NSLog("TB refresh() fired")
         }
+        // Three sources drive refresh() — the 2.5s dataTimer, the FSEvents stream, and
+        // the kqueue dirSource — all on the main thread. Each hands the (variable-length)
+        // process scan to a CONCURRENT global queue, so overlapping refreshes can finish
+        // OUT OF ORDER: an older snapshot, started before a state file changed, can land
+        // on the main thread AFTER a newer one and overwrite fresh state with stale —
+        // flashing a row back to its previous color for a frame (the periodic needs→done→
+        // needs / idle→needs→idle twitch). Stamp each refresh with a generation and drop
+        // any snapshot that a newer refresh has already superseded — only the latest wins.
+        refreshGen &+= 1
+        let gen = refreshGen
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             let realRows = self.fetchRows()
             DispatchQueue.main.async {
+                guard gen == self.refreshGen else { return }
                 let rows = self.applyAck(realRows)
                 self.rows = rows
                 self.updateButton()
@@ -651,10 +672,16 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    // Fire a toast whenever a session newly enters needs/done.
+    // Fire a toast only when a session newly enters "needs" (红, awaiting your
+    // input — the one thing you must not miss). "done" (绿) is intentionally
+    // silent here: it's just a turn wrapping up — often a background task in a
+    // sibling tab finishing on its own — and a focus-grabbing, all-spaces banner
+    // for every completion popped over whatever you were doing out of nowhere.
+    // The menu-bar done count and the hook's Glass sound already report it, and
+    // the menu row still click-to-jumps.
     private func notifyTransitions(_ newRows: [SessionRow]) {
         if primed {
-            for row in newRows where row.status == "needs" || row.status == "done" {
+            for row in newRows where row.status == "needs" {
                 if lastStatus[row.id] != row.status {
                     ToastManager.shared.show(title: row.display, status: row.status, path: row.id) { [weak self] in
                         self?.focus(row)
@@ -662,11 +689,13 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
-        // Auto-dismiss once a session leaves needs/done — e.g. the user went to
-        // the terminal and continued, flipping it to working via the hook. This
-        // is the fallback for setups without the companion extension's focus
+        // Auto-dismiss once a session is no longer awaiting you — the user went to
+        // the terminal and continued (→ working), it finished (→ done), or it went
+        // idle. done is included now: a needs→done transition must clear the red
+        // banner itself, since done no longer shows its own toast to replace it.
+        // This is the fallback for setups without the companion extension's focus
         // reporting; dismiss() is a no-op when there's no toast for the id.
-        for row in newRows where row.status != "needs" && row.status != "done" {
+        for row in newRows where row.status != "needs" {
             ToastManager.shared.dismiss(row.id)
         }
         // Sweep orphaned toasts: a session that ended (or changed identity) while
@@ -854,8 +883,10 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Reading window TITLES from CGWindowList needs Screen Recording permission; without
     // it titles come back empty, so we prompt once and fall back to a plain activate.
     private func raiseVSCodeWindow(cwd: String) {
+        NSLog("TB jump: raiseVSCodeWindow cwd=%@", cwd)
         guard let app = NSRunningApplication.runningApplications(
                   withBundleIdentifier: "com.microsoft.VSCode").first else {
+            NSLog("TB jump: no VSCode running → open")
             run("/usr/bin/open", ["-b", "com.microsoft.VSCode", cwd])
             return
         }
@@ -871,6 +902,9 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else { return nil }
             return (wid, title)
         }
+
+        NSLog("TB jump: pid=%d titled windows=%d → %@", pid, titled.count,
+              titled.map { "[\($0.wid):\($0.title)]" }.joined(separator: " "))
 
         // No titles → almost certainly missing Screen Recording permission (CGWindowList
         // withholds window names otherwise). Can't map cwd→window; prompt once, activate.
@@ -915,14 +949,77 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             target = titled.first(where: { $0.title.contains(name) })?.wid
         }
         guard let wid = target else {
+            NSLog("TB jump: NO title matched components=%@ → plain activate",
+                  components.joined(separator: ","))
             app.activate(options: [])
             return
         }
+        NSLog("TB jump: matched wid=%d → switchToSpace+focusWindow+activate", wid)
 
-        // Switch to the window's Space, then activate VSCode — the window is now on the
-        // current Space and becomes key. (Each Space holds one VSCode window here.)
+        // Two steps, not either/or. CGSManagedDisplaySetCurrentSpace reliably makes the
+        // target window's Space the visible one — this is what actually performs the jump.
+        // SLPS then makes that *exact* window key so the right window (not just the app)
+        // takes focus, and commits the current-Space change into the WindowServer's
+        // bookkeeping so the Dock, Mission Control and trackpad-swipe stay in sync.
+        //
+        // SLPS alone is NOT enough: _SLPSSetFrontProcessWithOptions only fronts the window;
+        // whether macOS *follows* you to its Space depends on the Mission Control setting
+        // "switch to a Space with open windows", which is off by default — so without the
+        // explicit switch the jump silently no-ops on most setups.
         switchToSpace(of: wid)
+        focusWindow(pid: pid, wid: wid)
         app.activate(options: [])
+    }
+
+    // MARK: Private SkyLight — native cross-Space window focus
+    //
+    // `_SLPSSetFrontProcessWithOptions` + two synthetic "activate" event records is the
+    // AltTab/yabai-proven way to make an arbitrary window key — including one on another
+    // Space — and to commit that focus into the WindowServer's bookkeeping. It does NOT by
+    // itself move you to the window's Space (that follows the Mission Control setting,
+    // default off), so callers must switchToSpace first. Returns false if SkyLight, the
+    // symbols, or the PSN lookup are unavailable.
+    private typealias SLPSSetFrontFn =
+        @convention(c) (UnsafePointer<ProcessSerialNumber>, CGWindowID, UInt32) -> CGError
+    private typealias SLPSPostFn =
+        @convention(c) (UnsafePointer<ProcessSerialNumber>, UnsafePointer<UInt8>) -> CGError
+
+    private lazy var slHandle = dlopen(
+        "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
+
+    @discardableResult
+    private func focusWindow(pid: pid_t, wid: CGWindowID) -> Bool {
+        guard let h = slHandle,
+              let frontSym = dlsym(h, "_SLPSSetFrontProcessWithOptions"),
+              let postSym = dlsym(h, "SLPSPostEventRecordTo") else {
+            NSLog("TB jump: focusWindow SLPS symbols unavailable → false"); return false }
+        var psn = ProcessSerialNumber()
+        guard _GetProcessForPID(pid, &psn) == noErr else {
+            NSLog("TB jump: focusWindow GetProcessForPID failed → false"); return false }
+        let setFront = unsafeBitCast(frontSym, to: SLPSSetFrontFn.self)
+        let post = unsafeBitCast(postSym, to: SLPSPostFn.self)
+
+        // 0x200 = .userGenerated — tells the WindowServer this is a real user focus, so it
+        // performs the visible Space-switch animation and commits the current-Space change.
+        _ = setFront(&psn, wid, 0x200)
+
+        // Two opaque event records (offsets/flags are the long-stable AltTab constants)
+        // that finish making the window key. Without them the app comes forward but the
+        // specific window may not take focus.
+        var bytes1 = [UInt8](repeating: 0, count: 0xf8)
+        bytes1[0x04] = 0xf8
+        bytes1[0x08] = 0x01
+        bytes1[0x3a] = 0x10
+        var bytes2 = bytes1
+        var w = wid
+        memcpy(&bytes1[0x3c], &w, MemoryLayout<CGWindowID>.size)
+        memset(&bytes1[0x20], 0xff, 0x10)
+        bytes2[0x08] = 0x02
+        memcpy(&bytes2[0x3c], &w, MemoryLayout<CGWindowID>.size)
+        memset(&bytes2[0x20], 0xff, 0x10)
+        _ = post(&psn, &bytes1)
+        _ = post(&psn, &bytes2)
+        return true
     }
 
     // MARK: Private CGS — cross-Space window control
