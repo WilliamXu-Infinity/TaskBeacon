@@ -17,17 +17,92 @@ fileprivate enum DisplayItem {
     case child(SessionRow)                                        // session under a header
 }
 
+// MARK: - Drag-to-reorder
+//
+// Every header and child carries a grip on its leading edge. Grabbing the grip
+// starts a row drag; grabbing anywhere else keeps the normal click (jump on a
+// child, collapse on a header). Headers reorder the folder groups; children
+// reorder only within their own group. The custom order is in-memory only — it
+// rides reloads but resets on app restart.
+
+private let reorderType = NSPasteboard.PasteboardType("com.taskbeacon.row")
+
+// The leading reorder grip shared by headers and children: a faint three-line
+// glyph the user grabs to drag a row up/down.
+private func makeGrip() -> NSImageView {
+    let v = NSImageView()
+    v.image = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: "拖动排序")?
+        .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold))
+    v.contentTintColor = .tertiaryLabelColor
+    v.imageScaling = .scaleNone
+    v.translatesAutoresizingMaskIntoConstraints = false
+    return v
+}
+
+// A cell that exposes its leading drag grip so the table can tell a grip-grab
+// (start a drag) from a body click (jump / collapse).
+protocol HandleProviding: AnyObject {
+    var dragHandle: NSView { get }
+}
+
+// NSTableView that begins a row drag only when the mouse-down lands on a row's
+// grip. A grip-grab opens a manual dragging session and swallows the click so the
+// grip never jumps/collapses; anything else falls through to normal click handling.
+final class ReorderTableView: NSTableView {
+
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        let row = self.row(at: p)
+        if row >= 0,
+           let cell = view(atColumn: 0, row: row, makeIfNecessary: false) as? HandleProviding {
+            let handle = cell.dragHandle
+            let ph = handle.convert(event.locationInWindow, from: nil)
+            if handle.bounds.contains(ph) {
+                beginHandleDrag(row: row, event: event)
+                return
+            }
+        }
+        super.mouseDown(with: event)
+    }
+
+    private func beginHandleDrag(row: Int, event: NSEvent) {
+        guard let cell = view(atColumn: 0, row: row, makeIfNecessary: false) else { return }
+        let item = NSPasteboardItem()
+        item.setString(String(row), forType: reorderType)
+        let dragItem = NSDraggingItem(pasteboardWriter: item)
+        dragItem.setDraggingFrame(rect(ofRow: row), contents: snapshot(of: cell))
+        let session = beginDraggingSession(with: [dragItem], event: event, source: self)
+        session.animatesToStartingPositionsOnCancelOrFail = true
+    }
+
+    override func draggingSession(_ session: NSDraggingSession,
+                                  sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        context == .withinApplication ? .move : []
+    }
+
+    private func snapshot(of view: NSView) -> NSImage {
+        let img = NSImage(size: view.bounds.size)
+        if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: rep)
+            img.addRepresentation(rep)
+        }
+        return img
+    }
+}
+
 final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
 
     private var rows: [SessionRow] = []
     private var items: [DisplayItem] = []
     private var collapsed: Set<String> = []      // cwds whose children are hidden
+    private var folderOrder: [String] = []       // custom folder order (cwds), ranked before the alphabetical rest
+    private var childOrder: [String: [String]] = [:]   // per-cwd custom child order (ttys), ranked before the seq rest
     private var lastToggledCwd: String?          // header just toggled by a single click (undone if a double-click follows)
     var onJump: ((SessionRow) -> Void)?
     var onJumpFolder: ((String) -> Void)?
     var onRefresh: (() -> Void)?
 
-    private let tableView = NSTableView()
+    private let tableView = ReorderTableView()
     private let titleLabel = NSTextField(labelWithString: "TaskBeacon")
     private let summaryLabel = NSTextField(labelWithString: "")
     private let emptyLabel = NSTextField(labelWithString: "")
@@ -129,6 +204,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         tableView.target = self
         tableView.action = #selector(rowClicked)
         tableView.doubleAction = #selector(rowDoubleClicked)
+        tableView.registerForDraggedTypes([reorderType])
         scroll.documentView = tableView
         glass.addSubview(scroll)
 
@@ -185,22 +261,129 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         stopSpinAfterRefresh()   // fresh data landed → end the click-triggered spin
     }
 
-    // Group the (already stably-sorted) rows by folder. Folder order is FIXED —
-    // alphabetical by cwd — so groups never float on a status change; within a group
-    // the rows keep their incoming (session-number) order. Status only recolors.
+    // Group the rows by folder. The base order is FIXED — folders alphabetical by
+    // cwd, children by session number — so nothing floats on a status change (status
+    // only recolors). A drag-reorder layers a custom order on top: folders/children
+    // the user has dragged sort by their saved rank; everything else keeps the base
+    // order, slotted after the ranked items.
     private func group(_ rows: [SessionRow]) -> [DisplayItem] {
         var groups: [String: [SessionRow]] = [:]
         for r in rows { groups[r.cwd, default: []].append(r) }
-        let keys = groups.keys.sorted()
+
+        let keys = groups.keys.sorted { ranked($0, $1, in: folderOrder, fallback: <) }
+
         var out: [DisplayItem] = []
         for key in keys {
-            let g = groups[key]!
+            var g = groups[key]!
+            if let ord = childOrder[key] {
+                g.sort { a, b in ranked(a.tty, b.tty, in: ord) { _, _ in a.seq < b.seq } }
+            }
             let folder = (key as NSString).lastPathComponent
             let isCollapsed = collapsed.contains(key)
             out.append(.header(folder: folder, cwd: key, counts: Self.counts(g), collapsed: isCollapsed))
             if !isCollapsed { for s in g { out.append(.child(s)) } }
         }
         return out
+    }
+
+    // Comparator that puts items present in `order` first (in that order), and
+    // breaks ties among unranked items with `fallback`.
+    private func ranked<T: Equatable>(_ a: T, _ b: T, in order: [T], fallback: (T, T) -> Bool) -> Bool {
+        switch (order.firstIndex(of: a), order.firstIndex(of: b)) {
+        case let (x?, y?): return x < y
+        case (_?, nil):    return true
+        case (nil, _?):    return false
+        case (nil, nil):   return fallback(a, b)
+        }
+    }
+
+    // MARK: Drag-to-reorder (drop side)
+
+    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo,
+                   proposedRow row: Int, proposedDropOperation op: NSTableView.DropOperation) -> NSDragOperation {
+        guard let src = sourceRow(from: info) else { return [] }
+        // Retarget an onto-row drop to an insertion so the whole row height is a valid
+        // drop target, not just the thin gaps between rows.
+        tableView.setDropRow(constrainedDropRow(source: src, proposed: row), dropOperation: .above)
+        return .move
+    }
+
+    func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo,
+                   row: Int, dropOperation op: NSTableView.DropOperation) -> Bool {
+        guard let src = sourceRow(from: info) else { return false }
+        let target = constrainedDropRow(source: src, proposed: row)
+        switch items[src] {
+        case .header: reorderFolder(from: src, toRow: target)
+        case .child:  reorderChild(from: src, toRow: target)
+        }
+        items = group(rows)
+        tableView.reloadData()
+        return true
+    }
+
+    private func sourceRow(from info: NSDraggingInfo) -> Int? {
+        guard let s = info.draggingPasteboard.string(forType: reorderType),
+              let r = Int(s), r >= 0, r < items.count else { return nil }
+        return r
+    }
+
+    // A child may only drop within its own group; a header snaps to a folder boundary.
+    private func constrainedDropRow(source src: Int, proposed: Int) -> Int {
+        switch items[src] {
+        case .child:
+            let h = parentHeaderIndex(of: src)
+            return min(max(proposed, h + 1), groupEnd(headerAt: h))
+        case .header:
+            return folderBoundaries().min(by: { abs($0 - proposed) < abs($1 - proposed) }) ?? proposed
+        }
+    }
+
+    // Index of the header at/above `row`.
+    private func parentHeaderIndex(of row: Int) -> Int {
+        var i = row
+        while i > 0 { if case .header = items[i] { return i }; i -= 1 }
+        return 0
+    }
+
+    // First index past the group whose header is at `h` (next header, or items.count).
+    private func groupEnd(headerAt h: Int) -> Int {
+        var i = h + 1
+        while i < items.count { if case .header = items[i] { break }; i += 1 }
+        return i
+    }
+
+    // Table rows where a folder may start: every header, plus end-of-list.
+    private func folderBoundaries() -> [Int] {
+        var b = items.indices.filter { if case .header = items[$0] { return true }; return false }
+        b.append(items.count)
+        return b
+    }
+
+    private func reorderChild(from src: Int, toRow target: Int) {
+        guard case .child(let moved) = items[src] else { return }
+        let h = parentHeaderIndex(of: src)
+        var ttys: [String] = []
+        var i = h + 1
+        while i < items.count, case .child(let c) = items[i] { ttys.append(c.tty); i += 1 }
+        guard let from = ttys.firstIndex(of: moved.tty) else { return }
+        var to = target - (h + 1)
+        ttys.remove(at: from)
+        if from < to { to -= 1 }
+        ttys.insert(moved.tty, at: min(max(to, 0), ttys.count))
+        childOrder[moved.cwd] = ttys
+    }
+
+    private func reorderFolder(from src: Int, toRow target: Int) {
+        guard case .header(_, let cwd, _, _) = items[src] else { return }
+        var keys: [String] = items.compactMap { if case .header(_, let k, _, _) = $0 { return k }; return nil }
+        guard let from = keys.firstIndex(of: cwd) else { return }
+        var to = items[0..<min(target, items.count)].reduce(0) { n, it in
+            if case .header = it { return n + 1 }; return n
+        }
+        keys.remove(at: from)
+        if from < to { to -= 1 }
+        keys.insert(cwd, at: min(max(to, 0), keys.count))
+        folderOrder = keys
     }
 
     // Aggregate badge counts for a folder header: colored buckets, nonzero only,
@@ -341,13 +524,16 @@ final class TransparentRowView: NSTableRowView {
 // on the right (●2 red / ●1 blue / ●1 green) so the whole window's state reads at
 // a glance. Click → raise the folder's window.
 
-final class HeaderCell: NSTableCellView {
+final class HeaderCell: NSTableCellView, HandleProviding {
     private let card = GlassCard(radius: Theme.card)
+    private let handle = makeGrip()
     private let chevron = NSImageView()
     private let folderLabel = NSTextField(labelWithString: "")
     private let badgeStack = NSStackView()
     private var badges: [CapsuleLabel] = []
     private var hovering = false
+
+    var dragHandle: NSView { handle }
 
     init(id: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
@@ -355,6 +541,9 @@ final class HeaderCell: NSTableCellView {
 
         card.translatesAutoresizingMaskIntoConstraints = false
         addSubview(card)
+
+        // Leading grip: grab to drag the whole folder group up/down.
+        card.addSubview(handle)
 
         // Disclosure chevron: ▸ collapsed, ▾ expanded. Click the header to toggle.
         chevron.contentTintColor = .secondaryLabelColor
@@ -378,7 +567,12 @@ final class HeaderCell: NSTableCellView {
             card.topAnchor.constraint(equalTo: topAnchor, constant: 4),
             card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
 
-            chevron.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: Theme.inset),
+            handle.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 7),
+            handle.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            handle.widthAnchor.constraint(equalToConstant: 16),
+            handle.heightAnchor.constraint(equalToConstant: 28),
+
+            chevron.leadingAnchor.constraint(equalTo: handle.trailingAnchor, constant: 6),
             chevron.centerYAnchor.constraint(equalTo: card.centerYAnchor),
             chevron.widthAnchor.constraint(equalToConstant: 11),
 
@@ -436,8 +630,9 @@ final class HeaderCell: NSTableCellView {
 // the tty, its status pill, and a left rail tinted by status. Click → focus that
 // exact terminal.
 
-final class ChildCell: NSTableCellView {
+final class ChildCell: NSTableCellView, HandleProviding {
     private let card = GlassCard(radius: Theme.card - 2, glows: false)
+    private let handle = makeGrip()
     private let rail = NSView()
     private let dot = StatusDot(diameter: 9)
     private let ttyLabel = NSTextField(labelWithString: "")
@@ -446,12 +641,17 @@ final class ChildCell: NSTableCellView {
     private var status = "idle"
     private var hovering = false
 
+    var dragHandle: NSView { handle }
+
     init(id: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
         identifier = id
 
         card.translatesAutoresizingMaskIntoConstraints = false
         addSubview(card)
+
+        // Leading grip: grab to reorder this session within its folder group.
+        card.addSubview(handle)
 
         // A thin status-tinted rail at the left edge ties the child to its group.
         rail.wantsLayer = true
@@ -480,7 +680,12 @@ final class ChildCell: NSTableCellView {
             card.topAnchor.constraint(equalTo: topAnchor, constant: 3),
             card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
 
-            rail.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 6),
+            handle.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 5),
+            handle.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            handle.widthAnchor.constraint(equalToConstant: 16),
+            handle.heightAnchor.constraint(equalToConstant: 26),
+
+            rail.leadingAnchor.constraint(equalTo: handle.trailingAnchor, constant: 3),
             rail.centerYAnchor.constraint(equalTo: card.centerYAnchor),
             rail.widthAnchor.constraint(equalToConstant: 3),
             rail.heightAnchor.constraint(equalToConstant: 18),
