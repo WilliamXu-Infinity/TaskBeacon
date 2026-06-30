@@ -2,13 +2,6 @@ import Cocoa
 import Darwin
 import ApplicationServices
 
-// GetProcessForPID is marked unavailable in the Swift overlay (deprecated since 10.9),
-// but the C symbol is still exported by HIServices and remains the only way to turn a
-// pid into the ProcessSerialNumber that SkyLight's focus API wants. Bind it directly.
-@_silgen_name("GetProcessForPID")
-private func _GetProcessForPID(
-    _ pid: pid_t, _ psn: UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
-
 // One row in the menu = one live Claude session (one interactive `claude`
 // process). Two sessions in the same VSCode window become two rows.
 struct SessionRow {
@@ -934,26 +927,11 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             dir = (dir as NSString).deletingLastPathComponent
         }
 
-        // VSCode titles look like "file.ext — RootName — Visual Studio Code", joined by
-        // the title separator (default em-dash, customizable to "-"/"|"). Split a title
-        // into its segments so we can compare the workspace-root segment to a folder
-        // name EXACTLY. A loose substring test mis-fires: a generic subdir like "web" is
-        // a substring of another project's title "web-dashboard". Exact-segment match
-        // skips that false hit and keeps walking up to the real root ("myapp"). We split
-        // only on whole separators (em/en-dash, pipe) — never bare "-", which appears
-        // inside folder names like "vscode-extension" — and also treat the whole trimmed
-        // title as one segment so plain single-folder titles ("myapp") still match.
-        func segments(of title: String) -> [String] {
-            var segs = title.components(separatedBy: CharacterSet(charactersIn: "—–|"))
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-            segs.append(title.trimmingCharacters(in: .whitespaces))
-            return segs.filter { !$0.isEmpty }
-        }
-
         // Pass 1 exact segment, Pass 2 loose substring fallback (decorated titles).
+        // titleSegments() explains the matching rules.
         var target: CGWindowID?
         for name in components where target == nil {
-            target = titled.first(where: { segments(of: $0.title).contains(name) })?.wid
+            target = titled.first(where: { titleSegments($0.title).contains(name) })?.wid
         }
         for name in components where target == nil {
             target = titled.first(where: { $0.title.contains(name) })?.wid
@@ -964,72 +942,69 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             app.activate(options: [])
             return
         }
-        NSLog("TB jump: matched wid=%d → switchToSpace+focusWindow+activate", wid)
+        NSLog("TB jump: matched wid=%d → switchToSpace+AXraise+activate", wid)
 
-        // Two steps, not either/or. CGSManagedDisplaySetCurrentSpace reliably makes the
-        // target window's Space the visible one — this is what actually performs the jump.
-        // SLPS then makes that *exact* window key so the right window (not just the app)
-        // takes focus, and commits the current-Space change into the WindowServer's
-        // bookkeeping so the Dock, Mission Control and trackpad-swipe stay in sync.
-        //
-        // SLPS alone is NOT enough: _SLPSSetFrontProcessWithOptions only fronts the window;
-        // whether macOS *follows* you to its Space depends on the Mission Control setting
-        // "switch to a Space with open windows", which is off by default — so without the
-        // explicit switch the jump silently no-ops on most setups.
+        // Two distinct problems, two steps:
+        //   1) cross-Space — make the target window's Space current. No-op when it's already
+        //      visible (e.g. all VSCode windows maximized on one shared Space).
+        //   2) same-Space pick — `activate` only fronts the APP, leaving whatever window was
+        //      already on top; useless when several VSCode windows are stacked on one Space.
+        //      AXRaise brings the matched window ITSELF forward. AX can only see windows on
+        //      the CURRENT Space, so it must run after switchToSpace.
         switchToSpace(of: wid)
-        focusWindow(pid: pid, wid: wid)
+        raiseAXWindow(pid: pid, components: components)
         app.activate(options: [])
     }
 
-    // MARK: Private SkyLight — native cross-Space window focus
-    //
-    // `_SLPSSetFrontProcessWithOptions` + two synthetic "activate" event records is the
-    // AltTab/yabai-proven way to make an arbitrary window key — including one on another
-    // Space — and to commit that focus into the WindowServer's bookkeeping. It does NOT by
-    // itself move you to the window's Space (that follows the Mission Control setting,
-    // default off), so callers must switchToSpace first. Returns false if SkyLight, the
-    // symbols, or the PSN lookup are unavailable.
-    private typealias SLPSSetFrontFn =
-        @convention(c) (UnsafePointer<ProcessSerialNumber>, CGWindowID, UInt32) -> CGError
-    private typealias SLPSPostFn =
-        @convention(c) (UnsafePointer<ProcessSerialNumber>, UnsafePointer<UInt8>) -> CGError
+    // VSCode titles look like "file.ext — RootName — Visual Studio Code", joined by the
+    // title separator (default em-dash, customizable to "-"/"|"). Split a title into its
+    // segments so we can compare the workspace-root segment to a folder name EXACTLY. A
+    // loose substring test mis-fires: a generic subdir like "web" is a substring of another
+    // project's title "web-dashboard". Exact-segment match skips that false hit and keeps
+    // walking up to the real root ("myapp"). We split only on whole separators (em/en-dash,
+    // pipe) — never bare "-", which appears inside folder names like "vscode-extension" —
+    // and also treat the whole trimmed title as one segment so plain single-folder titles
+    // ("myapp") still match.
+    private func titleSegments(_ title: String) -> [String] {
+        var segs = title.components(separatedBy: CharacterSet(charactersIn: "—–|"))
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        segs.append(title.trimmingCharacters(in: .whitespaces))
+        return segs.filter { !$0.isEmpty }
+    }
 
-    private lazy var slHandle = dlopen(
-        "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
+    // Raise the one VSCode window whose title matches `components`, via the Accessibility
+    // API — the only way to front a SPECIFIC window (not just the app) when several are
+    // stacked on the same Space. kAXWindowsAttribute lists only current-Space windows, so
+    // callers switch to the target Space first. Needs Accessibility permission; silently
+    // no-ops without it (the caller's `activate` still runs as a fallback).
+    private func raiseAXWindow(pid: pid_t, components: [String]) {
+        let app = AXUIElementCreateApplication(pid)
+        var winsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+                  app, kAXWindowsAttribute as CFString, &winsRef) == .success,
+              let wins = winsRef as? [AXUIElement] else {
+            NSLog("TB jump: raiseAXWindow no AX windows (perm?) → skip"); return }
 
-    @discardableResult
-    private func focusWindow(pid: pid_t, wid: CGWindowID) -> Bool {
-        guard let h = slHandle,
-              let frontSym = dlsym(h, "_SLPSSetFrontProcessWithOptions"),
-              let postSym = dlsym(h, "SLPSPostEventRecordTo") else {
-            NSLog("TB jump: focusWindow SLPS symbols unavailable → false"); return false }
-        var psn = ProcessSerialNumber()
-        guard _GetProcessForPID(pid, &psn) == noErr else {
-            NSLog("TB jump: focusWindow GetProcessForPID failed → false"); return false }
-        let setFront = unsafeBitCast(frontSym, to: SLPSSetFrontFn.self)
-        let post = unsafeBitCast(postSym, to: SLPSPostFn.self)
+        func axTitle(_ w: AXUIElement) -> String {
+            var t: CFTypeRef?
+            AXUIElementCopyAttributeValue(w, kAXTitleAttribute as CFString, &t)
+            return (t as? String) ?? ""
+        }
 
-        // 0x200 = .userGenerated — tells the WindowServer this is a real user focus, so it
-        // performs the visible Space-switch animation and commits the current-Space change.
-        _ = setFront(&psn, wid, 0x200)
+        // Same two-pass match as the CGWindowList path (exact segment, then loose substring).
+        var win: AXUIElement?
+        for name in components where win == nil {
+            win = wins.first { titleSegments(axTitle($0)).contains(name) }
+        }
+        for name in components where win == nil {
+            win = wins.first { axTitle($0).contains(name) }
+        }
+        guard let target = win else {
+            NSLog("TB jump: raiseAXWindow no AX title matched → skip"); return }
 
-        // Two opaque event records (offsets/flags are the long-stable AltTab constants)
-        // that finish making the window key. Without them the app comes forward but the
-        // specific window may not take focus.
-        var bytes1 = [UInt8](repeating: 0, count: 0xf8)
-        bytes1[0x04] = 0xf8
-        bytes1[0x08] = 0x01
-        bytes1[0x3a] = 0x10
-        var bytes2 = bytes1
-        var w = wid
-        memcpy(&bytes1[0x3c], &w, MemoryLayout<CGWindowID>.size)
-        memset(&bytes1[0x20], 0xff, 0x10)
-        bytes2[0x08] = 0x02
-        memcpy(&bytes2[0x3c], &w, MemoryLayout<CGWindowID>.size)
-        memset(&bytes2[0x20], 0xff, 0x10)
-        _ = post(&psn, &bytes1)
-        _ = post(&psn, &bytes2)
-        return true
+        AXUIElementSetAttributeValue(target, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementPerformAction(target, kAXRaiseAction as CFString)
+        NSLog("TB jump: raiseAXWindow raised matching window")
     }
 
     // MARK: Private CGS — cross-Space window control
