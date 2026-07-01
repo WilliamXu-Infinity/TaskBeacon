@@ -52,6 +52,54 @@ final class StatusDot: NSView {
             core.add(g, forKey: "pulse")
         }
     }
+
+    // Morph the dot into a "success" badge: the core snaps to done-green (with a
+    // little pop) and a white checkmark strokes itself in on top. This is the
+    // acknowledgement beat a resolving "needs" toast plays — the instant, obvious
+    // "got it ✓" that a plain fade-out never gave. Idempotent-safe: the caller
+    // guards against replaying it.
+    func morphToCheck() {
+        let c = Status.accent("done")
+        core.removeAnimation(forKey: "pulse")
+        core.backgroundColor = c.cgColor
+        core.shadowColor = c.cgColor
+        core.shadowRadius = 5
+
+        // A quick scale pop (anchor is the layer center) so the green "lands".
+        let pop = CAKeyframeAnimation(keyPath: "transform.scale")
+        pop.values = [1.0, 1.22, 1.0]
+        pop.keyTimes = [0, 0.4, 1]
+        pop.duration = 0.34
+        pop.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        core.add(pop, forKey: "pop")
+
+        // White checkmark, stroked in over the green core. Points are in the dot's
+        // y-up layer space: down to the low vertex, then up to the tall right arm.
+        let w = bounds.width, h = bounds.height
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: w * 0.26, y: h * 0.54))
+        path.addLine(to: CGPoint(x: w * 0.43, y: h * 0.34))
+        path.addLine(to: CGPoint(x: w * 0.74, y: h * 0.68))
+        let check = CAShapeLayer()
+        check.frame = bounds
+        check.path = path
+        check.fillColor = NSColor.clear.cgColor
+        check.strokeColor = NSColor.white.cgColor
+        check.lineWidth = max(1.5, w * 0.14)
+        check.lineCap = .round
+        check.lineJoin = .round
+        check.strokeEnd = 1
+        layer?.addSublayer(check)
+
+        let draw = CABasicAnimation(keyPath: "strokeEnd")
+        draw.fromValue = 0
+        draw.toValue = 1
+        draw.duration = 0.26
+        draw.beginTime = CACurrentMediaTime() + 0.08   // let the green land first
+        draw.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        draw.fillMode = .backwards
+        check.add(draw, forKey: "draw")
+    }
 }
 
 // MARK: - Capsule label (status pill / stat chip share this base)

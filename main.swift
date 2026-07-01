@@ -40,14 +40,6 @@ struct SessionRow {
 //   idle    灰白 闲置/连接中
 
 enum Status {
-    static func color(_ s: String) -> NSColor {
-        switch s {
-        case "needs":   return .systemRed
-        case "working": return .systemBlue
-        case "done":    return .systemGreen
-        default:        return .lightGray
-        }
-    }
     static func label(_ s: String) -> String {
         switch s {
         case "needs":   return "需确认"
@@ -86,6 +78,24 @@ final class ClickableEffectView: NSVisualEffectView {
     }
 }
 
+// One live banner: the panel plus the inner views a resolve animation recolors.
+// Holding these refs is what lets a "needs" toast morph green + check in place
+// instead of being torn down and rebuilt.
+final class Toast {
+    let panel: NSPanel
+    let path: String
+    let iconTile: NSView
+    let dot: StatusDot
+    let pill: CapsuleLabel
+    let hint: NSTextField
+    var resolving = false
+    init(panel: NSPanel, path: String, iconTile: NSView,
+         dot: StatusDot, pill: CapsuleLabel, hint: NSTextField) {
+        self.panel = panel; self.path = path; self.iconTile = iconTile
+        self.dot = dot; self.pill = pill; self.hint = hint
+    }
+}
+
 final class ToastManager {
     static let shared = ToastManager()
 
@@ -103,7 +113,7 @@ final class ToastManager {
         return img
     }
 
-    private var toasts: [(panel: NSPanel, path: String)] = []
+    private var toasts: [Toast] = []
     // Apple-notification proportions: icon-height + padding, just tall enough for
     // a two-line text block. The status pill caps the top-right like a timestamp,
     // so the card reads as one tight unit instead of a sparse bar.
@@ -114,15 +124,17 @@ final class ToastManager {
     private let lifetime: TimeInterval = 8
 
     // path is the identity: a fresh transition for the same project replaces the
-    // old toast instead of stacking a duplicate.
+    // old toast instead of stacking a duplicate — including one mid-resolve (a quick
+    // needs→done→needs), so the new red isn't left stacked behind a lingering check.
     func show(title: String, status: String, path: String, onClick: @escaping () -> Void) {
-        dismiss(path)
+        if let existing = toasts.first(where: { $0.path == path }) { remove(existing) }
 
-        let panel = makePanel(title: title, status: status) { [weak self] in
+        let toast = makeToast(title: title, status: status, path: path) { [weak self] in
             onClick()
             self?.dismiss(path)
         }
-        toasts.append((panel, path))
+        let panel = toast.panel
+        toasts.append(toast)
         relayout()
 
         panel.alphaValue = 1
@@ -146,6 +158,30 @@ final class ToastManager {
         for path in toasts.map({ $0.path }) where path.hasSuffix(suffix) { dismiss(path) }
     }
 
+    // The "confirmed" beat: a needs-toast whose session just answered morphs green
+    // + check in place, holds a moment, then fades — so answering gets an instant,
+    // unmistakable acknowledgement instead of the banner blinking out (or lingering
+    // red while the state file catches up). No-op if there's no toast for the id or
+    // it's already resolving.
+    func resolve(_ path: String) {
+        guard let toast = toasts.first(where: { $0.path == path }), !toast.resolving else { return }
+        toast.resolving = true
+
+        toast.dot.morphToCheck()
+        toast.pill.configure(status: "done", text: Status.label("done"))
+        toast.iconTile.layer?.backgroundColor = Status.tint("done").cgColor
+        toast.iconTile.layer?.borderColor = Status.accent("done").withAlphaComponent(0.35).cgColor
+        toast.hint.stringValue = "已确认"
+        toast.hint.textColor = Status.accent("done")
+
+        // Hold on the green check long enough to register, then fade + tear down.
+        // Capture the instance so a replaced toast (re-show) isn't torn down by us.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.95) { [weak self, weak toast] in
+            guard let self, let toast else { return }
+            self.remove(toast)
+        }
+    }
+
     // Dismiss any toast whose owning session is no longer live. A "needs" toast
     // never auto-times-out (you must not miss it), so without this it outlives a
     // session that ended — or changed identity — while still awaiting confirmation,
@@ -154,8 +190,19 @@ final class ToastManager {
         for path in toasts.map({ $0.path }) where !liveIds.contains(path) { dismiss(path) }
     }
 
+    // A resolving toast owns its own teardown (green → check → fade), so an
+    // incidental dismiss — the needs→done transition's own clear, a focus sweep,
+    // a retain pass — must not yank it early. remove() is the unconditional path.
     func dismiss(_ path: String) {
-        guard let idx = toasts.firstIndex(where: { $0.path == path }) else { return }
+        guard let toast = toasts.first(where: { $0.path == path }), !toast.resolving else { return }
+        remove(toast)
+    }
+
+    // Teardown is keyed on the Toast instance, not its path: a session can bounce
+    // needs→done→needs faster than the resolve hold, leaving a stale removal timer
+    // that would otherwise fade the fresh red toast sharing the same path.
+    private func remove(_ toast: Toast) {
+        guard let idx = toasts.firstIndex(where: { $0 === toast }) else { return }
         let panel = toasts.remove(at: idx).panel
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.18
@@ -171,13 +218,13 @@ final class ToastManager {
         let vf = screen.visibleFrame
         let x = vf.maxX - width - margin
         var y = vf.maxY - margin - height
-        for (panel, _) in toasts {
-            panel.setFrameOrigin(NSPoint(x: x, y: y))
+        for toast in toasts {
+            toast.panel.setFrameOrigin(NSPoint(x: x, y: y))
             y -= (height + spacing)
         }
     }
 
-    private func makePanel(title: String, status: String, onClick: @escaping () -> Void) -> NSPanel {
+    private func makeToast(title: String, status: String, path: String, onClick: @escaping () -> Void) -> Toast {
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -290,16 +337,22 @@ final class ToastManager {
         ])
 
         panel.contentView = effect
-        return panel
+        return Toast(panel: panel, path: path, iconTile: iconTile,
+                     dot: dot, pill: pill, hint: hintLabel)
     }
 }
 
 // MARK: - App controller
 
-class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
+class AppController: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem!
+    private let popover = NSPopover()
+    private lazy var popoverController = MenuPopoverController(model: model)
     private var rows: [SessionRow] = []
+    // Shared grouping / ordering / collapse state, also handed to the main window
+    // so both surfaces stay in sync.
+    private let model = ListModel()
     private var dataTimer: Timer?
     private var animTimer: Timer?
     // Monotonic refresh stamp + serial scan queue: every refresh() bumps the stamp and
@@ -327,8 +380,13 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // poll that would recover it.
     private var activityToken: NSObjectProtocol?
 
-    private var menuRows: [(item: NSMenuItem, row: SessionRow)] = []
     private var mainWindowController: MainWindowController?
+
+    // Global唤起 hotkey: press it anywhere to pop the menu-bar session list. The
+    // binding is user-editable in the main window and persisted in UserDefaults;
+    // `currentCombo` is nil only when the user has explicitly cleared it.
+    private var hotKey: GlobalHotKey!
+    private var currentCombo: HotKeyCombo?
 
     // Last seen status per session id; used to fire a toast only on the
     // transition *into* needs/done. `primed` suppresses a burst of toasts for
@@ -351,7 +409,6 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var spinnerIndex = 0
     private var spinner: String { spinnerFrames[spinnerIndex % spinnerFrames.count] }
 
-    private let menuFont = NSFont.menuFont(ofSize: 0)
     private let dataDir = "\(NSHomeDirectory())/.claude/taskbeacon"
     private let vscodeExtDir = "\(NSHomeDirectory())/.vscode/extensions"
 
@@ -362,13 +419,29 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "…"
+        // A click toggles a popover (not a native NSMenu) — the dropdown hosts the
+        // same drag-reorderable list as the main window, which a menu's modal
+        // tracking loop can't support.
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(togglePopover)
 
-        let menu = NSMenu()
-        menu.delegate = self
-        statusItem.menu = menu
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentViewController = popoverController
+        popoverController.onJump         = { [weak self] row in self?.popover.performClose(nil); self?.focus(row) }
+        popoverController.onOpenWindow   = { [weak self] in self?.popover.performClose(nil); self?.openMainWindow() }
+        popoverController.onRefresh      = { [weak self] in self?.manualRefresh() }
+        popoverController.onQuit         = { [weak self] in self?.quit() }
+        popoverController.onFixPermission = { [weak self] in self?.popover.performClose(nil); self?.presentAccessibilityPrompt() }
 
         activityToken = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated], reason: "Live Claude session monitoring")
+
+        // Global唤起 hotkey — bind the saved (or default) combo so pressing it from
+        // any app pops the session list open. nil means the user cleared it.
+        currentCombo = HotKeyCombo.load()
+        hotKey = GlobalHotKey { [weak self] in self?.openFromHotKey() }
+        if let combo = currentCombo { hotKey.update(combo) }
 
         lastFocusToken = readFocusToken()   // prime: ignore whatever focus is already recorded
         showMainWindow()
@@ -460,10 +533,12 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard gen == self.refreshGen else { return }
                 let rows = self.applyAck(realRows)
                 self.rows = rows
+                self.model.update(rows)
                 self.updateButton()
                 self.notifyTransitions(rows)
                 self.dismissFocusedToast()
                 self.mainWindowController?.reload(rows)
+                if self.popover.isShown { self.popoverController.reload(rows) }
                 if ProcessInfo.processInfo.environment["TB_DEBUG"] != nil {
                     NSLog("TB refresh() done in %.0f ms", Date().timeIntervalSince(t0) * 1000)
                 }
@@ -692,14 +767,14 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
-        // Auto-dismiss once a session is no longer awaiting you — the user went to
-        // the terminal and continued (→ working), it finished (→ done), or it went
-        // idle. done is included now: a needs→done transition must clear the red
-        // banner itself, since done no longer shows its own toast to replace it.
-        // This is the fallback for setups without the companion extension's focus
-        // reporting; dismiss() is a no-op when there's no toast for the id.
+        // Resolve once a session is no longer awaiting you — you answered and it went
+        // working / done / idle. resolve() morphs the still-visible red banner green
+        // with a check ✓ before it fades, turning the moment you confirm into instant,
+        // visible acknowledgement (instead of the banner lingering red until the state
+        // file flips, then blinking out). No-op when there's no toast for the id, so
+        // the spontaneous done of a background sibling stays silent as before.
         for row in newRows where row.status != "needs" {
-            ToastManager.shared.dismiss(row.id)
+            ToastManager.shared.resolve(row.id)
         }
         // Sweep orphaned toasts: a session that ended (or changed identity) while
         // "needs" left no row above to clear it, so clear it by absence here — newRows
@@ -712,19 +787,6 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: Rendering
-
-    private func glyph(_ status: String) -> String {
-        status == "working" ? spinner : "●"
-    }
-
-    private func rowAttributed(_ row: SessionRow) -> NSAttributedString {
-        let m = NSMutableAttributedString()
-        m.append(NSAttributedString(string: glyph(row.status) + "  ",
-                                    attributes: [.foregroundColor: Status.color(row.status), .font: menuFont]))
-        m.append(NSAttributedString(string: row.display,
-                                    attributes: [.font: menuFont]))
-        return m
-    }
 
     private func updateButton() {
         let m = NSMutableAttributedString()
@@ -748,74 +810,43 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.attributedTitle = m
     }
 
+    // Drives only the menu-bar title spinner; the dropdown's child dots animate
+    // themselves (StatusDot breathes for "working").
     private func tick() {
         guard rows.contains(where: { $0.status == "working" }) else { return }
         spinnerIndex += 1
         updateButton()
-        for entry in menuRows where entry.row.status == "working" {
-            entry.item.attributedTitle = rowAttributed(entry.row)
-        }
     }
 
-    // MARK: Menu
+    // MARK: Popover (menu-bar dropdown)
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        menu.removeAllItems()
-        menuRows.removeAll()
-
-        if rows.isEmpty {
-            let item = NSMenuItem(title: "没有在跑的 Claude", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        } else {
-            let header = NSMenuItem(
-                title: "\(rows.count) 个会话",
-                action: nil, keyEquivalent: "")
-            header.isEnabled = false
-            menu.addItem(header)
-            menu.addItem(.separator())
-
-            for row in rows {
-                let item = NSMenuItem(title: "", action: #selector(jump(_:)), keyEquivalent: "")
-                item.attributedTitle = rowAttributed(row)
-                item.target = self
-                item.representedObject = row.id
-                menu.addItem(item)
-                menuRows.append((item, row))
-            }
-        }
-
-        menu.addItem(.separator())
-        // Persistent affordance: only while the jump permission is missing, so the
-        // user can always re-open the enable flow if they dismissed the launch prompt.
-        if !AXIsProcessTrusted() {
-            let axItem = NSMenuItem(title: "⚠️ 开启跳转权限（辅助功能）",
-                                    action: #selector(presentAccessibilityPrompt), keyEquivalent: "")
-            axItem.target = self
-            menu.addItem(axItem)
-        }
-        let openItem = NSMenuItem(title: "🪟 打开主界面", action: #selector(openMainWindow), keyEquivalent: "o")
-        openItem.target = self
-        menu.addItem(openItem)
-        let refreshItem = NSMenuItem(title: "🔄 刷新", action: #selector(manualRefresh), keyEquivalent: "r")
-        refreshItem.target = self
-        menu.addItem(refreshItem)
-        let quitItem = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(quitItem)
+    // The global hotkey fired: pop the menu-bar list open so the user sees every
+    // live session at a glance. Reuses the status-item toggle (press again to
+    // dismiss), matching how a menu-bar app's hotkey normally behaves.
+    private func openFromHotKey() {
+        togglePopover()
     }
 
-    func menuDidClose(_ menu: NSMenu) {
-        menuRows.removeAll()
+    // User rebound (or cleared) the唤起 hotkey in the main window. Persist it and
+    // re-register the Carbon binding; nil clears it entirely.
+    private func rebindHotKey(_ combo: HotKeyCombo?) {
+        currentCombo = combo
+        HotKeyCombo.persist(combo)
+        if let combo = combo { hotKey.update(combo) } else { hotKey.unregister() }
+    }
+
+    @objc private func togglePopover() {
+        if popover.isShown { popover.performClose(nil); return }
+        guard let button = statusItem.button else { return }
+        refresh()                       // land fresh data before the panel appears
+        popoverController.reload(rows)
+        // Activate so the transient popover can become key and receive the
+        // click-outside that dismisses it (a status click alone doesn't activate us).
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
     }
 
     // MARK: Actions
-
-    @objc private func jump(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String,
-              let row = rows.first(where: { $0.id == id }) else { return }
-        focus(row)
-    }
 
     // Jump to this session. When the companion extension is installed we also write
     // the target shellPid to the focus-request file that every VSCode window watches;
@@ -863,12 +894,6 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let row = rows.first(where: { $0.shellPid == pid }) {
             acknowledge(row.id, status: row.status)   // no-op unless done
         }
-    }
-
-    // Raise the folder's VSCode window (no single terminal to focus). Used when a
-    // group header — which represents a whole window — is clicked.
-    private func focusFolder(_ cwd: String) {
-        raiseVSCodeWindow(cwd: cwd)
     }
 
     // Bring the VSCode window that owns `cwd` to the front — across desktops/displays.
@@ -1176,15 +1201,28 @@ class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func showMainWindow() {
         if mainWindowController == nil {
-            let wc = MainWindowController()
+            let wc = MainWindowController(model: model)
             wc.onJump = { [weak self] row in self?.focus(row) }
-            wc.onJumpFolder = { [weak self] cwd in self?.focusFolder(cwd) }
             wc.onRefresh = { [weak self] in self?.refresh() }
+            wc.onRebind = { [weak self] combo in self?.rebindHotKey(combo) }
+            wc.setHotKeyCombo(currentCombo)
             mainWindowController = wc
         }
         mainWindowController?.reload(rows)
         mainWindowController?.showWindow(nil)
+        ensureWindowOnScreen()
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    // A stale autosaved frame (setFrameAutosaveName) can restore the window onto a
+    // display that's since been disconnected, stranding it off-screen where it can't
+    // be seen or focused. If its frame doesn't intersect any active screen, recenter
+    // it on the main one.
+    private func ensureWindowOnScreen() {
+        guard let window = mainWindowController?.window else { return }
+        let frame = window.frame
+        let onScreen = NSScreen.screens.contains { $0.visibleFrame.intersects(frame) }
+        if !onScreen { window.center() }
     }
 
     // Closing the window keeps the app alive in the menu bar.

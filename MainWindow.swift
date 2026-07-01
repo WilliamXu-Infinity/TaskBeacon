@@ -8,14 +8,8 @@ import Cocoa
 // titlebar is hidden and content runs full-bleed; rows are individual glass
 // cards that brighten + glow on hover. Click a row → jump to its VSCode + mark seen.
 
-// One visual line in the list. Every folder (= VSCode window) renders the same
-// way regardless of session count: a header (folder name + aggregate count
-// badges) followed by one indented child per terminal. A lone session is just a
-// header with a single child — keeps the layout uniform.
-fileprivate enum DisplayItem {
-    case header(folder: String, cwd: String, counts: [(String, Int)], collapsed: Bool)
-    case child(SessionRow)                                        // session under a header
-}
+// The grouped list model (DisplayItem, folder ordering, collapse) lives in
+// ListModel.swift and is shared with the menu-bar dropdown.
 
 // MARK: - Drag-to-reorder
 //
@@ -25,7 +19,7 @@ fileprivate enum DisplayItem {
 // reorder only within their own group. The custom order is in-memory only — it
 // rides reloads but resets on app restart.
 
-private let reorderType = NSPasteboard.PasteboardType("com.taskbeacon.row")
+let reorderType = NSPasteboard.PasteboardType("com.taskbeacon.row")
 
 // The leading reorder grip shared by headers and children: a faint three-line
 // glyph the user grabs to drag a row up/down.
@@ -90,22 +84,18 @@ final class ReorderTableView: NSTableView {
     }
 }
 
-final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+final class MainWindowController: NSWindowController {
 
-    private var rows: [SessionRow] = []
-    private var items: [DisplayItem] = []
-    private var collapsed: Set<String> = []      // cwds whose children are hidden
-    private var folderOrder: [String] = []       // custom folder order (cwds), ranked before the alphabetical rest
-    private var childOrder: [String: [String]] = [:]   // per-cwd custom child order (ttys), ranked before the seq rest
-    private var lastToggledCwd: String?          // header just toggled by a single click (undone if a double-click follows)
+    private let model: ListModel
     var onJump: ((SessionRow) -> Void)?
-    var onJumpFolder: ((String) -> Void)?
     var onRefresh: (() -> Void)?
+    // Fires when the user rebinds (or clears, → nil) the global唤起 hotkey.
+    var onRebind: ((HotKeyCombo?) -> Void)?
 
-    private let tableView = ReorderTableView()
+    private lazy var listView = SessionListView(model: model)
+    private let recorder = HotKeyRecorderButton()
     private let titleLabel = NSTextField(labelWithString: "TaskBeacon")
     private let summaryLabel = NSTextField(labelWithString: "")
-    private let emptyLabel = NSTextField(labelWithString: "")
     private var statChips: [(view: CapsuleLabel, status: String)] = []
     private let chipStack = NSStackView()
     private var refreshButton: GlassButton!
@@ -113,7 +103,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     private var stopScheduled = false     // a (possibly delayed) stop is already queued
     private var spinMinUntil: Date?       // don't stop before this time
 
-    convenience init() {
+    init(model: ListModel) {
+        self.model = model
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 460, height: 560),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -128,9 +119,10 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         window.center()
         window.setFrameAutosaveName("TaskBeaconMain")
         window.minSize = NSSize(width: 380, height: 360)
-        self.init(window: window)
+        super.init(window: window)
         setupUI()
     }
+    required init?(coder: NSCoder) { fatalError() }
 
     private func setupUI() {
         guard let window = window, let content = window.contentView else { return }
@@ -175,47 +167,19 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             statChips.append((chip, status))
         }
 
-        // ── List ──
-        let scroll = NSScrollView()
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.hasVerticalScroller = true
-        // Force a floating (overlay) scroller even when the system pref is "Always
-        // show scroll bars" — a legacy scroller reserves a ~15pt right gutter that
-        // shifts the cards left of the refresh button. OverlayScroller pins its
-        // reported style to .overlay so the content stays full-bleed.
-        scroll.verticalScroller = OverlayScroller()
-        scroll.scrollerStyle = .overlay
-        scroll.autohidesScrollers = true
-        scroll.drawsBackground = false
-        scroll.automaticallyAdjustsContentInsets = false
-        scroll.contentInsets = NSEdgeInsets(top: 4, left: 0, bottom: 6, right: 0)
+        // ── List (shared, drag-reorderable) ──
+        listView.onJump = { [weak self] row in self?.onJump?(row) }
+        listView.translatesAutoresizingMaskIntoConstraints = false
+        glass.addSubview(listView)
 
-        let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("main"))
-        col.resizingMask = .autoresizingMask
-        tableView.addTableColumn(col)
-        tableView.headerView = nil
-        tableView.rowHeight = Theme.rowHeight
-        tableView.intercellSpacing = NSSize(width: 0, height: 0)
-        tableView.backgroundColor = .clear
-        tableView.style = .plain
-        tableView.selectionHighlightStyle = .none   // cells draw their own hover
-        tableView.dataSource = self
-        tableView.delegate = self
-        tableView.target = self
-        tableView.action = #selector(rowClicked)
-        tableView.doubleAction = #selector(rowDoubleClicked)
-        tableView.registerForDraggedTypes([reorderType])
-        scroll.documentView = tableView
-        glass.addSubview(scroll)
-
-        emptyLabel.stringValue = "No Claude sessions running\n没有在跑的 Claude 会话"
-        emptyLabel.font = Theme.font(13, .medium)
-        emptyLabel.textColor = .tertiaryLabelColor
-        emptyLabel.alignment = .center
-        emptyLabel.maximumNumberOfLines = 2
-        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
-        emptyLabel.isHidden = true
-        glass.addSubview(emptyLabel)
+        // ── Footer: global唤起-hotkey binder (label leading, recorder trailing) ──
+        let hotkeyLabel = NSTextField(labelWithString: "唤起快捷键")
+        hotkeyLabel.font = Theme.font(12, .medium)
+        hotkeyLabel.textColor = .secondaryLabelColor
+        hotkeyLabel.translatesAutoresizingMaskIntoConstraints = false
+        glass.addSubview(hotkeyLabel)
+        recorder.onChange = { [weak self] combo in self?.onRebind?(combo) }
+        glass.addSubview(recorder)
 
         let top = window.contentLayoutGuide as! NSLayoutGuide
         NSLayoutConstraint.activate([
@@ -231,203 +195,39 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             chipStack.leadingAnchor.constraint(equalTo: summaryLabel.trailingAnchor, constant: 10),
             chipStack.centerYAnchor.constraint(equalTo: summaryLabel.centerYAnchor),
 
-            scroll.leadingAnchor.constraint(equalTo: glass.leadingAnchor, constant: Theme.pad - 6),
-            scroll.trailingAnchor.constraint(equalTo: glass.trailingAnchor, constant: -(Theme.pad - 6)),
-            scroll.topAnchor.constraint(equalTo: chipStack.bottomAnchor, constant: 8),
-            scroll.bottomAnchor.constraint(equalTo: glass.bottomAnchor, constant: -8),
+            listView.leadingAnchor.constraint(equalTo: glass.leadingAnchor, constant: Theme.pad - 6),
+            listView.trailingAnchor.constraint(equalTo: glass.trailingAnchor, constant: -(Theme.pad - 6)),
+            listView.topAnchor.constraint(equalTo: chipStack.bottomAnchor, constant: 8),
+            listView.bottomAnchor.constraint(equalTo: recorder.topAnchor, constant: -8),
 
-            emptyLabel.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
-            emptyLabel.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
+            hotkeyLabel.leadingAnchor.constraint(equalTo: glass.leadingAnchor, constant: Theme.pad),
+            hotkeyLabel.centerYAnchor.constraint(equalTo: recorder.centerYAnchor),
+
+            recorder.trailingAnchor.constraint(equalTo: glass.trailingAnchor, constant: -Theme.pad),
+            recorder.bottomAnchor.constraint(equalTo: glass.bottomAnchor, constant: -12),
         ])
     }
 
+    // Seed the recorder with the currently-bound combo (called by the controller).
+    func setHotKeyCombo(_ combo: HotKeyCombo?) {
+        recorder.setCombo(combo)
+    }
+
     func reload(_ newRows: [SessionRow]) {
-        rows = newRows
-        items = group(newRows)
-        summaryLabel.stringValue = rows.isEmpty
+        summaryLabel.stringValue = newRows.isEmpty
             ? "—"
-            : "\(rows.count) session\(rows.count == 1 ? "" : "s")"
+            : "\(newRows.count) session\(newRows.count == 1 ? "" : "s")"
 
         for (chip, status) in statChips {
-            let n = rows.filter { $0.status == status }.count
+            let n = newRows.filter { $0.status == status }.count
             chip.isHidden = n == 0
             if n > 0 { chip.configureCount(status: status, count: n) }
         }
 
-        emptyLabel.isHidden = !rows.isEmpty
-        chipStack.isHidden = rows.isEmpty
-        tableView.reloadData()
+        chipStack.isHidden = newRows.isEmpty
+        listView.reload(newRows)
 
         stopSpinAfterRefresh()   // fresh data landed → end the click-triggered spin
-    }
-
-    // Group the rows by folder. The base order is FIXED — folders alphabetical by
-    // cwd, children by session number — so nothing floats on a status change (status
-    // only recolors). A drag-reorder layers a custom order on top: folders/children
-    // the user has dragged sort by their saved rank; everything else keeps the base
-    // order, slotted after the ranked items.
-    private func group(_ rows: [SessionRow]) -> [DisplayItem] {
-        var groups: [String: [SessionRow]] = [:]
-        for r in rows { groups[r.cwd, default: []].append(r) }
-
-        let keys = groups.keys.sorted { ranked($0, $1, in: folderOrder, fallback: <) }
-
-        var out: [DisplayItem] = []
-        for key in keys {
-            var g = groups[key]!
-            if let ord = childOrder[key] {
-                g.sort { a, b in ranked(a.tty, b.tty, in: ord) { _, _ in a.seq < b.seq } }
-            }
-            let folder = (key as NSString).lastPathComponent
-            let isCollapsed = collapsed.contains(key)
-            out.append(.header(folder: folder, cwd: key, counts: Self.counts(g), collapsed: isCollapsed))
-            if !isCollapsed { for s in g { out.append(.child(s)) } }
-        }
-        return out
-    }
-
-    // Comparator that puts items present in `order` first (in that order), and
-    // breaks ties among unranked items with `fallback`.
-    private func ranked<T: Equatable>(_ a: T, _ b: T, in order: [T], fallback: (T, T) -> Bool) -> Bool {
-        switch (order.firstIndex(of: a), order.firstIndex(of: b)) {
-        case let (x?, y?): return x < y
-        case (_?, nil):    return true
-        case (nil, _?):    return false
-        case (nil, nil):   return fallback(a, b)
-        }
-    }
-
-    // MARK: Drag-to-reorder (drop side)
-
-    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo,
-                   proposedRow row: Int, proposedDropOperation op: NSTableView.DropOperation) -> NSDragOperation {
-        guard let src = sourceRow(from: info) else { return [] }
-        // Retarget an onto-row drop to an insertion so the whole row height is a valid
-        // drop target, not just the thin gaps between rows.
-        tableView.setDropRow(constrainedDropRow(source: src, proposed: row), dropOperation: .above)
-        return .move
-    }
-
-    func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo,
-                   row: Int, dropOperation op: NSTableView.DropOperation) -> Bool {
-        guard let src = sourceRow(from: info) else { return false }
-        let target = constrainedDropRow(source: src, proposed: row)
-        switch items[src] {
-        case .header: reorderFolder(from: src, toRow: target)
-        case .child:  reorderChild(from: src, toRow: target)
-        }
-        items = group(rows)
-        tableView.reloadData()
-        return true
-    }
-
-    private func sourceRow(from info: NSDraggingInfo) -> Int? {
-        guard let s = info.draggingPasteboard.string(forType: reorderType),
-              let r = Int(s), r >= 0, r < items.count else { return nil }
-        return r
-    }
-
-    // A child may only drop within its own group; a header snaps to a folder boundary.
-    private func constrainedDropRow(source src: Int, proposed: Int) -> Int {
-        switch items[src] {
-        case .child:
-            let h = parentHeaderIndex(of: src)
-            return min(max(proposed, h + 1), groupEnd(headerAt: h))
-        case .header:
-            return folderBoundaries().min(by: { abs($0 - proposed) < abs($1 - proposed) }) ?? proposed
-        }
-    }
-
-    // Index of the header at/above `row`.
-    private func parentHeaderIndex(of row: Int) -> Int {
-        var i = row
-        while i > 0 { if case .header = items[i] { return i }; i -= 1 }
-        return 0
-    }
-
-    // First index past the group whose header is at `h` (next header, or items.count).
-    private func groupEnd(headerAt h: Int) -> Int {
-        var i = h + 1
-        while i < items.count { if case .header = items[i] { break }; i += 1 }
-        return i
-    }
-
-    // Table rows where a folder may start: every header, plus end-of-list.
-    private func folderBoundaries() -> [Int] {
-        var b = items.indices.filter { if case .header = items[$0] { return true }; return false }
-        b.append(items.count)
-        return b
-    }
-
-    private func reorderChild(from src: Int, toRow target: Int) {
-        guard case .child(let moved) = items[src] else { return }
-        let h = parentHeaderIndex(of: src)
-        var ttys: [String] = []
-        var i = h + 1
-        while i < items.count, case .child(let c) = items[i] { ttys.append(c.tty); i += 1 }
-        guard let from = ttys.firstIndex(of: moved.tty) else { return }
-        var to = target - (h + 1)
-        ttys.remove(at: from)
-        if from < to { to -= 1 }
-        ttys.insert(moved.tty, at: min(max(to, 0), ttys.count))
-        childOrder[moved.cwd] = ttys
-    }
-
-    private func reorderFolder(from src: Int, toRow target: Int) {
-        guard case .header(_, let cwd, _, _) = items[src] else { return }
-        var keys: [String] = items.compactMap { if case .header(_, let k, _, _) = $0 { return k }; return nil }
-        guard let from = keys.firstIndex(of: cwd) else { return }
-        var to = items[0..<min(target, items.count)].reduce(0) { n, it in
-            if case .header = it { return n + 1 }; return n
-        }
-        keys.remove(at: from)
-        if from < to { to -= 1 }
-        keys.insert(cwd, at: min(max(to, 0), keys.count))
-        folderOrder = keys
-    }
-
-    // Aggregate badge counts for a folder header: colored buckets, nonzero only,
-    // urgency order. seen + idle collapse into one gray bucket.
-    private static func counts(_ g: [SessionRow]) -> [(String, Int)] {
-        var out: [(String, Int)] = []
-        for st in ["needs", "working", "done"] {
-            let n = g.filter { $0.status == st }.count
-            if n > 0 { out.append((st, n)) }
-        }
-        let gray = g.filter { $0.status == "seen" || $0.status == "idle" }.count
-        if gray > 0 { out.append(("idle", gray)) }
-        return out
-    }
-
-    // MARK: Table
-
-    func numberOfRows(in tableView: NSTableView) -> Int { items.count }
-
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        switch items[row] {
-        case .header: return 46
-        case .child:  return 50
-        }
-    }
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        switch items[row] {
-        case .header(let folder, _, let counts, let collapsed):
-            let id = NSUserInterfaceItemIdentifier("header")
-            let cell = (tableView.makeView(withIdentifier: id, owner: self) as? HeaderCell) ?? HeaderCell(id: id)
-            cell.configure(folder: folder, counts: counts, collapsed: collapsed)
-            return cell
-        case .child(let r):
-            let id = NSUserInterfaceItemIdentifier("child")
-            let cell = (tableView.makeView(withIdentifier: id, owner: self) as? ChildCell) ?? ChildCell(id: id)
-            cell.configure(r)
-            return cell
-        }
-    }
-
-    // No row-level selection background — the card owns its visuals.
-    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
-        TransparentRowView()
     }
 
     // Spin the refresh glyph the moment it's clicked, so a click always feels
@@ -457,65 +257,6 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         }
     }
 
-    // Single click: jump to VSCode only. Status is NOT changed by the click — a row
-    // greys to "闲置" solely on ground truth: you actually landing in the terminal
-    // (reported by the companion extension) for `done`, or the hook clearing `needs`
-    // once you really answer the prompt. Optimistically graying on click misreported
-    // state ("闲置" before you'd answered anything).
-    //
-    // A header distinguishes single vs double click: single click toggles the
-    // folder's collapse state, double click jumps to (raises) the folder's window.
-    // The single click acts immediately (no laggy double-click-interval wait); AppKit
-    // fires it on the first mouseUp of a double click too, so rowDoubleClicked undoes
-    // that toggle before jumping — net effect of a double click is just the jump.
-    @objc private func rowClicked() {
-        let r = tableView.clickedRow
-        guard r >= 0 && r < items.count else { return }
-        switch items[r] {
-        case .child(let row):
-            onJump?(row)
-        case .header(_, let cwd, _, _):
-            toggleCollapse(cwd)
-            lastToggledCwd = cwd
-        }
-    }
-
-    // Double click on a header → undo the toggle the preceding single click just made,
-    // then jump to the folder's window. (Children jump on single click; a double click
-    // there is a harmless no-op here.)
-    @objc private func rowDoubleClicked() {
-        let r = tableView.clickedRow
-        guard r >= 0 && r < items.count else { return }
-        if case .header(_, let cwd, _, _) = items[r] {
-            if let last = lastToggledCwd { toggleCollapse(last) }
-            onJumpFolder?(cwd)
-        }
-    }
-
-    private func toggleCollapse(_ cwd: String) {
-        lastToggledCwd = nil
-        if collapsed.contains(cwd) { collapsed.remove(cwd) } else { collapsed.insert(cwd) }
-        items = group(rows)
-        tableView.reloadData()
-    }
-}
-
-// A scroller that always behaves as an overlay (floating) scroller, regardless of
-// the system "Show scroll bars" preference. A legacy scroller reserves a fixed
-// gutter on the trailing edge, which would push the list cards left of the
-// refresh button; overlay scrollers float over the content and reserve nothing.
-final class OverlayScroller: NSScroller {
-    override class var isCompatibleWithOverlayScrollers: Bool { true }
-    override var scrollerStyle: NSScroller.Style {
-        get { .overlay }
-        set { super.scrollerStyle = .overlay }
-    }
-}
-
-// Kills the default blue selection fill so our glass cards stand alone.
-final class TransparentRowView: NSTableRowView {
-    override func drawSelection(in dirtyRect: NSRect) {}
-    override var isEmphasized: Bool { get { false } set {} }
 }
 
 // MARK: - Header cell (folder group, with aggregate count badges)
@@ -535,6 +276,13 @@ final class HeaderCell: NSTableCellView, HandleProviding {
 
     var dragHandle: NSView { handle }
 
+    // True if `windowPoint` lands on the disclosure chevron's (padded) hit area —
+    // the chevron glyph is tiny, so widen the tap target generously.
+    func chevronHit(_ windowPoint: NSPoint) -> Bool {
+        let p = chevron.convert(windowPoint, from: nil)
+        return chevron.bounds.insetBy(dx: -10, dy: -12).contains(p)
+    }
+
     init(id: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
         identifier = id
@@ -545,7 +293,7 @@ final class HeaderCell: NSTableCellView, HandleProviding {
         // Leading grip: grab to drag the whole folder group up/down.
         card.addSubview(handle)
 
-        // Disclosure chevron: ▸ collapsed, ▾ expanded. Click the header to toggle.
+        // Disclosure chevron: ▸ collapsed, ▾ expanded. Click the chevron to toggle.
         chevron.contentTintColor = .secondaryLabelColor
         chevron.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(chevron)

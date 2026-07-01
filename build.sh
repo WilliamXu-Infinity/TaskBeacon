@@ -16,12 +16,12 @@ mkdir -p "$BIN_DIR" "$RES_DIR"
 # Apple Silicon (arm64) and Intel (x86_64) Macs.
 if [ "${UNIVERSAL:-0}" = "1" ]; then
   TMP="$(mktemp -d)"
-  swiftc -O *.swift -o "$TMP/$NAME-arm64"  -framework Cocoa -target arm64-apple-macosx13.0
-  swiftc -O *.swift -o "$TMP/$NAME-x86_64" -framework Cocoa -target x86_64-apple-macosx13.0
+  swiftc -O *.swift -o "$TMP/$NAME-arm64"  -framework Cocoa -framework Carbon -target arm64-apple-macosx13.0
+  swiftc -O *.swift -o "$TMP/$NAME-x86_64" -framework Cocoa -framework Carbon -target x86_64-apple-macosx13.0
   lipo -create "$TMP/$NAME-arm64" "$TMP/$NAME-x86_64" -output "$BIN_DIR/$NAME"
   rm -rf "$TMP"
 else
-  swiftc -O *.swift -o "$BIN_DIR/$NAME" -framework Cocoa
+  swiftc -O *.swift -o "$BIN_DIR/$NAME" -framework Cocoa -framework Carbon
 fi
 
 # App icon: regenerate the iconset from the Core Graphics script, pack to .icns.
