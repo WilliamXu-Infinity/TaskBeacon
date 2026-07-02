@@ -8,7 +8,7 @@ import Cocoa
 // surfaces stay in sync (reorder or collapse in one, the other reflects it on its
 // next reload). Hosts supply only the chrome around it (titles, chips, footer) and
 // call reload().
-final class SessionListView: NSView, NSTableViewDataSource, NSTableViewDelegate {
+final class SessionListView: NSView, NSTableViewDataSource, NSTableViewDelegate, ReorderCoordinator {
 
     private let model: ListModel
     private var items: [DisplayItem] = []
@@ -24,8 +24,14 @@ final class SessionListView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         self.model = model
         super.init(frame: .zero)
         setup()
+        // Re-render in place when a display preference (e.g. status labels) flips.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(settingsChanged),
+            name: AppSettings.didChange, object: nil)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func settingsChanged() { tableView.reloadData() }
 
     private func setup() {
         // ── List ──
@@ -56,6 +62,7 @@ final class SessionListView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         tableView.target = self
         tableView.action = #selector(rowClicked)
         tableView.registerForDraggedTypes([reorderType])
+        tableView.coordinator = self
         scroll.documentView = tableView
         addSubview(scroll)
 
@@ -98,6 +105,28 @@ final class SessionListView: NSView, NSTableViewDataSource, NSTableViewDelegate 
         items = model.items()
         tableView.reloadData()
         onLayoutChange?()
+    }
+
+    // MARK: Drag-to-reorder (collapse-all while a header drags)
+
+    func rowIsHeader(_ row: Int) -> Bool {
+        guard row >= 0, row < items.count else { return false }
+        if case .header = items[row] { return true }
+        return false
+    }
+
+    func beginHeaderDrag(originalRow: Int) -> Int? {
+        guard originalRow >= 0, originalRow < items.count,
+              case .header(_, let cwd, _, _) = items[originalRow] else { return nil }
+        model.beginDragCollapseAll()
+        refreshItems()
+        // The dragged folder's new row index in the now all-collapsed list.
+        return items.firstIndex { if case .header(_, let k, _, _) = $0 { return k == cwd }; return false }
+    }
+
+    func endHeaderDrag() {
+        model.endDragCollapse()
+        refreshItems()
     }
 
     // MARK: Drag-to-reorder (drop side)

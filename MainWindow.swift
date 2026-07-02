@@ -21,16 +21,32 @@ import Cocoa
 
 let reorderType = NSPasteboard.PasteboardType("com.taskbeacon.row")
 
-// The leading reorder grip shared by headers and children: a faint three-line
-// glyph the user grabs to drag a row up/down.
-private func makeGrip() -> NSImageView {
-    let v = NSImageView()
-    v.image = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: "拖动排序")?
-        .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold))
-    v.contentTintColor = .tertiaryLabelColor
-    v.imageScaling = .scaleNone
-    v.translatesAutoresizingMaskIntoConstraints = false
-    return v
+// The leading status rail, which doubles as the reorder grip: a thin vertical bar,
+// tinted by status, that the user grabs to drag a row up/down. The visible bar sits
+// inside a wider transparent grab zone so it's an easy target, and shows an open-hand
+// cursor to read as draggable.
+final class RailGrip: NSView {
+    private let bar = NSView()
+
+    init(barHeight: CGFloat = 18) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        bar.wantsLayer = true
+        bar.layer?.cornerRadius = 1.5
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(bar)
+        NSLayoutConstraint.activate([
+            bar.centerXAnchor.constraint(equalTo: centerXAnchor),
+            bar.centerYAnchor.constraint(equalTo: centerYAnchor),
+            bar.widthAnchor.constraint(equalToConstant: 3),
+            bar.heightAnchor.constraint(equalToConstant: barHeight),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setColor(_ c: NSColor) { bar.layer?.backgroundColor = c.cgColor }
+
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
 }
 
 // A cell that exposes its leading drag grip so the table can tell a grip-grab
@@ -39,10 +55,23 @@ protocol HandleProviding: AnyObject {
     var dragHandle: NSView { get }
 }
 
+// Lets the table drive the "collapse every folder while a header drags" behavior
+// through its owner (SessionListView), which is the one that holds the model + items.
+protocol ReorderCoordinator: AnyObject {
+    func rowIsHeader(_ row: Int) -> Bool
+    // Collapse all folders, reload, and return the dragged header's new row index.
+    func beginHeaderDrag(originalRow: Int) -> Int?
+    // Restore the pre-drag collapse state and reload.
+    func endHeaderDrag()
+}
+
 // NSTableView that begins a row drag only when the mouse-down lands on a row's
 // grip. A grip-grab opens a manual dragging session and swallows the click so the
 // grip never jumps/collapses; anything else falls through to normal click handling.
 final class ReorderTableView: NSTableView {
+
+    weak var coordinator: ReorderCoordinator?
+    private var draggingHeader = false
 
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
@@ -61,10 +90,23 @@ final class ReorderTableView: NSTableView {
 
     private func beginHandleDrag(row: Int, event: NSEvent) {
         guard let cell = view(atColumn: 0, row: row, makeIfNecessary: false) else { return }
+        // Snapshot + grab point captured before any collapse so the floating image
+        // stays under the cursor where the user grabbed.
+        let snapshotImg = snapshot(of: cell)
+        let grabRect = rect(ofRow: row)
+
+        // Dragging a header collapses every folder for the duration; the header's row
+        // index shifts once the children vanish, so remap it for the drop logic.
+        var dragRow = row
+        draggingHeader = coordinator?.rowIsHeader(row) ?? false
+        if draggingHeader, let remapped = coordinator?.beginHeaderDrag(originalRow: row) {
+            dragRow = remapped
+        }
+
         let item = NSPasteboardItem()
-        item.setString(String(row), forType: reorderType)
+        item.setString(String(dragRow), forType: reorderType)
         let dragItem = NSDraggingItem(pasteboardWriter: item)
-        dragItem.setDraggingFrame(rect(ofRow: row), contents: snapshot(of: cell))
+        dragItem.setDraggingFrame(grabRect, contents: snapshotImg)
         let session = beginDraggingSession(with: [dragItem], event: event, source: self)
         session.animatesToStartingPositionsOnCancelOrFail = true
     }
@@ -72,6 +114,16 @@ final class ReorderTableView: NSTableView {
     override func draggingSession(_ session: NSDraggingSession,
                                   sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
         context == .withinApplication ? .move : []
+    }
+
+    // Fires after the drop is accepted (or the drag is cancelled) — restore the
+    // folders' pre-drag collapse state.
+    override func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint,
+                                  operation: NSDragOperation) {
+        if draggingHeader {
+            draggingHeader = false
+            coordinator?.endHeaderDrag()
+        }
     }
 
     private func snapshot(of view: NSView) -> NSImage {
@@ -89,11 +141,10 @@ final class MainWindowController: NSWindowController {
     private let model: ListModel
     var onJump: ((SessionRow) -> Void)?
     var onRefresh: (() -> Void)?
-    // Fires when the user rebinds (or clears, → nil) the global唤起 hotkey.
-    var onRebind: ((HotKeyCombo?) -> Void)?
+    var onOpenStats: (() -> Void)?
+    var onOpenSettings: (() -> Void)?
 
     private lazy var listView = SessionListView(model: model)
-    private let recorder = HotKeyRecorderButton()
     private let titleLabel = NSTextField(labelWithString: "TaskBeacon")
     private let summaryLabel = NSTextField(labelWithString: "")
     private var statChips: [(view: CapsuleLabel, status: String)] = []
@@ -155,6 +206,14 @@ final class MainWindowController: NSWindowController {
         refreshButton = refresh
         glass.addSubview(refresh)
 
+        let stats = GlassButton(symbol: "chart.bar", action: #selector(statsClicked), target: self)
+        stats.toolTip = "统计（任务 / 决定）"
+        glass.addSubview(stats)
+
+        let settings = GlassButton(symbol: "gearshape", action: #selector(settingsClicked), target: self)
+        settings.toolTip = "设置（快捷键）"
+        glass.addSubview(settings)
+
         // ── Stat chips (one per status, hidden when zero) ──
         chipStack.orientation = .horizontal
         chipStack.spacing = 7
@@ -172,15 +231,6 @@ final class MainWindowController: NSWindowController {
         listView.translatesAutoresizingMaskIntoConstraints = false
         glass.addSubview(listView)
 
-        // ── Footer: global唤起-hotkey binder (label leading, recorder trailing) ──
-        let hotkeyLabel = NSTextField(labelWithString: "唤起快捷键")
-        hotkeyLabel.font = Theme.font(12, .medium)
-        hotkeyLabel.textColor = .secondaryLabelColor
-        hotkeyLabel.translatesAutoresizingMaskIntoConstraints = false
-        glass.addSubview(hotkeyLabel)
-        recorder.onChange = { [weak self] combo in self?.onRebind?(combo) }
-        glass.addSubview(recorder)
-
         let top = window.contentLayoutGuide as! NSLayoutGuide
         NSLayoutConstraint.activate([
             titleLabel.leadingAnchor.constraint(equalTo: glass.leadingAnchor, constant: Theme.pad),
@@ -192,31 +242,24 @@ final class MainWindowController: NSWindowController {
             refresh.trailingAnchor.constraint(equalTo: glass.trailingAnchor, constant: -Theme.pad),
             refresh.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
 
+            settings.trailingAnchor.constraint(equalTo: refresh.leadingAnchor, constant: -8),
+            settings.centerYAnchor.constraint(equalTo: refresh.centerYAnchor),
+
+            stats.trailingAnchor.constraint(equalTo: settings.leadingAnchor, constant: -8),
+            stats.centerYAnchor.constraint(equalTo: refresh.centerYAnchor),
+
             chipStack.leadingAnchor.constraint(equalTo: summaryLabel.trailingAnchor, constant: 10),
             chipStack.centerYAnchor.constraint(equalTo: summaryLabel.centerYAnchor),
 
             listView.leadingAnchor.constraint(equalTo: glass.leadingAnchor, constant: Theme.pad - 6),
             listView.trailingAnchor.constraint(equalTo: glass.trailingAnchor, constant: -(Theme.pad - 6)),
             listView.topAnchor.constraint(equalTo: chipStack.bottomAnchor, constant: 8),
-            listView.bottomAnchor.constraint(equalTo: recorder.topAnchor, constant: -8),
-
-            hotkeyLabel.leadingAnchor.constraint(equalTo: glass.leadingAnchor, constant: Theme.pad),
-            hotkeyLabel.centerYAnchor.constraint(equalTo: recorder.centerYAnchor),
-
-            recorder.trailingAnchor.constraint(equalTo: glass.trailingAnchor, constant: -Theme.pad),
-            recorder.bottomAnchor.constraint(equalTo: glass.bottomAnchor, constant: -12),
+            listView.bottomAnchor.constraint(equalTo: glass.bottomAnchor, constant: -8),
         ])
     }
 
-    // Seed the recorder with the currently-bound combo (called by the controller).
-    func setHotKeyCombo(_ combo: HotKeyCombo?) {
-        recorder.setCombo(combo)
-    }
-
     func reload(_ newRows: [SessionRow]) {
-        summaryLabel.stringValue = newRows.isEmpty
-            ? "—"
-            : "\(newRows.count) session\(newRows.count == 1 ? "" : "s")"
+        summaryLabel.attributedStringValue = Self.summaryText(newRows)
 
         for (chip, status) in statChips {
             let n = newRows.filter { $0.status == status }.count
@@ -229,6 +272,39 @@ final class MainWindowController: NSWindowController {
 
         stopSpinAfterRefresh()   // fresh data landed → end the click-triggered spin
     }
+
+    // The header line: session count in bright primary text, then the combined
+    // running time (blue) and tokens (green) across all current sessions — colored
+    // and heavier so it reads clearly against the glass, not a dim gray blur.
+    private static func summaryText(_ rows: [SessionRow]) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        if rows.isEmpty {
+            out.append(NSAttributedString(string: "—", attributes: [
+                .foregroundColor: NSColor.secondaryLabelColor, .font: Theme.font(12, .medium)]))
+            return out
+        }
+        let n = rows.count
+        out.append(NSAttributedString(string: "\(n) session\(n == 1 ? "" : "s")", attributes: [
+            .foregroundColor: NSColor.labelColor, .font: Theme.font(12, .semibold)]))
+
+        let totWork = rows.reduce(0) { $0 + $1.workSec }
+        let totTok  = rows.reduce(0) { $0 + $1.tokens }
+        if totWork > 0 || totTok > 0 {
+            let sep: [NSAttributedString.Key: Any] = [
+                .foregroundColor: NSColor.tertiaryLabelColor, .font: Theme.font(12, .regular)]
+            out.append(NSAttributedString(string: "   ⏱ ", attributes: sep))
+            out.append(NSAttributedString(string: ChildCell.fmtDur(totWork), attributes: [
+                .foregroundColor: Status.accent("working"), .font: Theme.rounded(12.5, .bold)]))
+            out.append(NSAttributedString(string: "   ", attributes: sep))
+            out.append(NSAttributedString(string: ChildCell.fmtTok(totTok), attributes: [
+                .foregroundColor: Status.accent("done"), .font: Theme.rounded(12.5, .bold)]))
+            out.append(NSAttributedString(string: " tokens", attributes: sep))
+        }
+        return out
+    }
+
+    @objc private func statsClicked() { onOpenStats?() }
+    @objc private func settingsClicked() { onOpenSettings?() }
 
     // Spin the refresh glyph the moment it's clicked, so a click always feels
     // alive even before data lands. The next reload() stops it (see below).
@@ -267,14 +343,14 @@ final class MainWindowController: NSWindowController {
 
 final class HeaderCell: NSTableCellView, HandleProviding {
     private let card = GlassCard(radius: Theme.card)
-    private let handle = makeGrip()
+    private let railGrip = RailGrip(barHeight: 20)
     private let chevron = NSImageView()
     private let folderLabel = NSTextField(labelWithString: "")
     private let badgeStack = NSStackView()
     private var badges: [CapsuleLabel] = []
     private var hovering = false
 
-    var dragHandle: NSView { handle }
+    var dragHandle: NSView { railGrip }
 
     // True if `windowPoint` lands on the disclosure chevron's (padded) hit area —
     // the chevron glyph is tiny, so widen the tap target generously.
@@ -290,10 +366,11 @@ final class HeaderCell: NSTableCellView, HandleProviding {
         card.translatesAutoresizingMaskIntoConstraints = false
         addSubview(card)
 
-        // Leading grip: grab to drag the whole folder group up/down.
-        card.addSubview(handle)
+        // Leading status rail: grab it to drag the whole folder group up/down.
+        card.addSubview(railGrip)
 
-        // Disclosure chevron: ▸ collapsed, ▾ expanded. Click the chevron to toggle.
+        // Disclosure chevron: ▸ collapsed, ▾ expanded, parked on the far right.
+        // Click the chevron to toggle.
         chevron.contentTintColor = .secondaryLabelColor
         chevron.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(chevron)
@@ -315,21 +392,21 @@ final class HeaderCell: NSTableCellView, HandleProviding {
             card.topAnchor.constraint(equalTo: topAnchor, constant: 4),
             card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
 
-            handle.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 7),
-            handle.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-            handle.widthAnchor.constraint(equalToConstant: 16),
-            handle.heightAnchor.constraint(equalToConstant: 28),
+            railGrip.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
+            railGrip.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            railGrip.widthAnchor.constraint(equalToConstant: 14),
+            railGrip.heightAnchor.constraint(equalToConstant: 30),
 
-            chevron.leadingAnchor.constraint(equalTo: handle.trailingAnchor, constant: 6),
-            chevron.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-            chevron.widthAnchor.constraint(equalToConstant: 11),
-
-            folderLabel.leadingAnchor.constraint(equalTo: chevron.trailingAnchor, constant: 8),
+            folderLabel.leadingAnchor.constraint(equalTo: railGrip.trailingAnchor, constant: 8),
             folderLabel.centerYAnchor.constraint(equalTo: card.centerYAnchor),
             folderLabel.trailingAnchor.constraint(lessThanOrEqualTo: badgeStack.leadingAnchor, constant: -8),
 
-            badgeStack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -Theme.inset),
+            badgeStack.trailingAnchor.constraint(equalTo: chevron.leadingAnchor, constant: -10),
             badgeStack.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+
+            chevron.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -Theme.inset),
+            chevron.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            chevron.widthAnchor.constraint(equalToConstant: 11),
         ])
 
         applyHoverStyle(animated: false)
@@ -357,7 +434,9 @@ final class HeaderCell: NSTableCellView, HandleProviding {
         let cfg = NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
         chevron.image = NSImage(systemSymbolName: collapsed ? "chevron.right" : "chevron.down",
                                 accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
-        card.setAccent(counts.first?.0 ?? "idle")
+        let accent = counts.first?.0 ?? "idle"
+        card.setAccent(accent)
+        railGrip.setColor(Status.accent(accent))
 
         // Rebuild the badges to match this folder's nonzero buckets.
         badges.forEach { $0.removeFromSuperview() }
@@ -380,16 +459,19 @@ final class HeaderCell: NSTableCellView, HandleProviding {
 
 final class ChildCell: NSTableCellView, HandleProviding {
     private let card = GlassCard(radius: Theme.card - 2, glows: false)
-    private let handle = makeGrip()
-    private let rail = NSView()
+    private let railGrip = RailGrip(barHeight: 18)
     private let dot = StatusDot(diameter: 9)
     private let ttyLabel = NSTextField(labelWithString: "")
+    private let metaLabel = NSTextField(labelWithString: "")   // ⏱ time · tokens for this session
     private let pill = CapsuleLabel(showDot: false)
+    // Collapses the pill to zero width so the tty label reclaims the space when
+    // status labels are turned off in Settings.
+    private lazy var pillCollapse = pill.widthAnchor.constraint(equalToConstant: 0)
 
     private var status = "idle"
     private var hovering = false
 
-    var dragHandle: NSView { handle }
+    var dragHandle: NSView { railGrip }
 
     init(id: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
@@ -398,14 +480,9 @@ final class ChildCell: NSTableCellView, HandleProviding {
         card.translatesAutoresizingMaskIntoConstraints = false
         addSubview(card)
 
-        // Leading grip: grab to reorder this session within its folder group.
-        card.addSubview(handle)
-
-        // A thin status-tinted rail at the left edge ties the child to its group.
-        rail.wantsLayer = true
-        rail.layer?.cornerRadius = 1.5
-        rail.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(rail)
+        // The thin status-tinted rail at the left edge ties the child to its group,
+        // and doubles as the grip: grab it to reorder within the folder group.
+        card.addSubview(railGrip)
 
         dot.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(dot)
@@ -418,6 +495,13 @@ final class ChildCell: NSTableCellView, HandleProviding {
         ttyLabel.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(ttyLabel)
 
+        metaLabel.font = Theme.rounded(10.5, .medium)
+        metaLabel.textColor = .tertiaryLabelColor
+        metaLabel.lineBreakMode = .byTruncatingTail
+        metaLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        metaLabel.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(metaLabel)
+
         pill.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(pill)
 
@@ -428,24 +512,24 @@ final class ChildCell: NSTableCellView, HandleProviding {
             card.topAnchor.constraint(equalTo: topAnchor, constant: 3),
             card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
 
-            handle.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 5),
-            handle.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-            handle.widthAnchor.constraint(equalToConstant: 16),
-            handle.heightAnchor.constraint(equalToConstant: 26),
+            railGrip.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 5),
+            railGrip.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            railGrip.widthAnchor.constraint(equalToConstant: 14),
+            railGrip.heightAnchor.constraint(equalToConstant: 26),
 
-            rail.leadingAnchor.constraint(equalTo: handle.trailingAnchor, constant: 3),
-            rail.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-            rail.widthAnchor.constraint(equalToConstant: 3),
-            rail.heightAnchor.constraint(equalToConstant: 18),
-
-            dot.leadingAnchor.constraint(equalTo: rail.trailingAnchor, constant: 10),
+            dot.leadingAnchor.constraint(equalTo: railGrip.trailingAnchor, constant: 8),
             dot.centerYAnchor.constraint(equalTo: card.centerYAnchor),
             dot.widthAnchor.constraint(equalToConstant: 9),
             dot.heightAnchor.constraint(equalToConstant: 9),
 
+            // Title on top, usage meta beneath — the pair vertically centered.
             ttyLabel.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 10),
-            ttyLabel.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            ttyLabel.bottomAnchor.constraint(equalTo: card.centerYAnchor, constant: 0),
             ttyLabel.trailingAnchor.constraint(lessThanOrEqualTo: pill.leadingAnchor, constant: -8),
+
+            metaLabel.leadingAnchor.constraint(equalTo: ttyLabel.leadingAnchor),
+            metaLabel.topAnchor.constraint(equalTo: card.centerYAnchor, constant: 1),
+            metaLabel.trailingAnchor.constraint(lessThanOrEqualTo: pill.leadingAnchor, constant: -8),
 
             pill.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -Theme.inset),
             pill.centerYAnchor.constraint(equalTo: card.centerYAnchor),
@@ -475,9 +559,34 @@ final class ChildCell: NSTableCellView, HandleProviding {
         status = r.status
         dot.apply(r.status)
         card.setAccent(r.status)
-        rail.layer?.backgroundColor = Status.accent(r.status).cgColor
+        railGrip.setColor(Status.accent(r.status))
         ttyLabel.stringValue = r.taskTitle.isEmpty ? "会话 \(r.seqLabel)" : r.taskTitle
-        pill.configure(status: r.status, text: Status.label(r.status))
+        metaLabel.stringValue = Self.usageText(workSec: r.workSec, tokens: r.tokens)
+        let showPill = AppSettings.showStatusLabels
+        pill.isHidden = !showPill
+        pillCollapse.isActive = !showPill
+        if showPill { pill.configure(status: r.status, text: Status.label(r.status)) }
         applyHoverStyle(animated: false)
+    }
+
+    // "⏱ 12m · 1.2M" — this session's running time and total tokens since it began.
+    // Blank until it has actually done something, so a just-opened session stays clean.
+    static func usageText(workSec: Int, tokens: Int) -> String {
+        guard workSec > 0 || tokens > 0 else { return "尚未运行" }
+        return "⏱ \(fmtDur(workSec)) · \(fmtTok(tokens)) tokens"
+    }
+    static func fmtDur(_ sec: Int) -> String {
+        switch sec {
+        case 3600...: return String(format: "%.1fh", Double(sec) / 3600)
+        case 60...:   return "\(sec / 60)m"
+        default:      return "\(sec)s"
+        }
+    }
+    static func fmtTok(_ n: Int) -> String {
+        switch n {
+        case 1_000_000...: return String(format: "%.1fM", Double(n) / 1_000_000)
+        case 1_000...:     return String(format: "%.1fk", Double(n) / 1_000)
+        default:           return "\(n)"
+        }
     }
 }

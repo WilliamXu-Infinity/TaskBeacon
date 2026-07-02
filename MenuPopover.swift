@@ -18,6 +18,8 @@ final class MenuPopoverController: NSViewController {
     var onJump: ((SessionRow) -> Void)?
     var onRefresh: (() -> Void)?
     var onOpenWindow: (() -> Void)?
+    var onOpenStats: (() -> Void)?
+    var onOpenSettings: (() -> Void)?
     var onQuit: (() -> Void)?
     var onFixPermission: (() -> Void)?
 
@@ -61,12 +63,18 @@ final class MenuPopoverController: NSViewController {
         axButton.isHidden = true
         let openBtn = GlassButton(symbol: "macwindow", action: #selector(openWindow), target: self)
         openBtn.toolTip = "打开主界面"
+        let statsBtn = GlassButton(symbol: "chart.bar", action: #selector(statsClicked), target: self)
+        statsBtn.toolTip = "统计（任务 / 决定）"
+        let settingsBtn = GlassButton(symbol: "gearshape", action: #selector(settingsClicked), target: self)
+        settingsBtn.toolTip = "设置（快捷键）"
         let refreshBtn = GlassButton(symbol: "arrow.clockwise", action: #selector(refreshClicked), target: self)
         refreshBtn.toolTip = "刷新"
         let quitBtn = GlassButton(symbol: "power", action: #selector(quitClicked), target: self)
         quitBtn.toolTip = "退出"
         footer.addView(axButton, in: .leading)
         footer.addView(openBtn, in: .trailing)
+        footer.addView(statsBtn, in: .trailing)
+        footer.addView(settingsBtn, in: .trailing)
         footer.addView(refreshBtn, in: .trailing)
         footer.addView(quitBtn, in: .trailing)
 
@@ -111,6 +119,8 @@ final class MenuPopoverController: NSViewController {
 
     @objc private func fixPermission() { onFixPermission?() }
     @objc private func openWindow()    { onOpenWindow?() }
+    @objc private func statsClicked()  { onOpenStats?() }
+    @objc private func settingsClicked(){ onOpenSettings?() }
     @objc private func refreshClicked(){ onRefresh?() }
     @objc private func quitClicked()   { onQuit?() }
 }

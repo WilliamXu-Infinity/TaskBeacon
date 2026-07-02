@@ -13,8 +13,9 @@ enum DisplayItem {
 
 // The grouping / ordering / collapse state, owned once by AppController and shared
 // by both surfaces (main window + menu). Collapsing a folder or reordering it in
-// one place is therefore reflected in the other. The custom order and collapse set
-// are in-memory only — they ride reloads but reset on app restart.
+// one place is therefore reflected in the other. The custom order is persisted to
+// UserDefaults so a drag-reorder survives app restart; the collapse set is in-memory
+// only (rides reloads, resets on restart).
 //
 // Base order is FIXED — folders alphabetical by cwd, children by session number —
 // so nothing floats on a status change (status only recolors). A reorder (drag in
@@ -24,8 +25,27 @@ enum DisplayItem {
 final class ListModel {
     private(set) var rows: [SessionRow] = []
     private var collapsed: Set<String> = []            // cwds whose children are hidden
-    private var folderOrder: [String] = []             // custom folder order (cwds), ranked before the base rest
-    private var childOrder: [String: [String]] = [:]   // per-cwd custom child order (ttys), ranked before the seq rest
+    // Custom order, persisted (didSet → save). folderOrder is keyed by cwd (stable
+    // across restarts); childOrder by tty (a terminal reopens with a new tty, so a
+    // stale rank is simply ignored by `ranked`, not harmful).
+    private var folderOrder: [String] = [] { didSet { save() } }
+    private var childOrder: [String: [String]] = [:] { didSet { save() } }
+
+    private static let folderOrderKey = "listFolderOrder"
+    private static let childOrderKey = "listChildOrder"
+
+    init() {
+        let d = UserDefaults.standard
+        // Assigning in an initializer does not fire didSet — no need to re-save what we just read.
+        folderOrder = (d.array(forKey: Self.folderOrderKey) as? [String]) ?? []
+        childOrder = (d.dictionary(forKey: Self.childOrderKey) as? [String: [String]]) ?? [:]
+    }
+
+    private func save() {
+        let d = UserDefaults.standard
+        d.set(folderOrder, forKey: Self.folderOrderKey)
+        d.set(childOrder, forKey: Self.childOrderKey)
+    }
 
     func update(_ newRows: [SessionRow]) { rows = newRows }
 
@@ -88,6 +108,21 @@ final class ListModel {
 
     func toggleCollapse(_ cwd: String) {
         if collapsed.contains(cwd) { collapsed.remove(cwd) } else { collapsed.insert(cwd) }
+    }
+
+    // While a header drag is in flight, collapse every folder so the user reorders a
+    // clean list of folder rows; the prior per-folder state is stashed and restored
+    // verbatim when the drag ends (drop or cancel).
+    private var collapseBackup: Set<String>?
+
+    func beginDragCollapseAll() {
+        guard collapseBackup == nil else { return }
+        collapseBackup = collapsed
+        collapsed = Set(orderedFolders())
+    }
+
+    func endDragCollapse() {
+        if let backup = collapseBackup { collapsed = backup; collapseBackup = nil }
     }
 
     // MARK: Ordering

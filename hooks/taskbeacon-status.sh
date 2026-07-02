@@ -71,6 +71,9 @@ except Exception: pass
     clear|startup)
       rm -f "$dir/title-$tty"
       atomic_write "$dir/state-$tty" "idle"
+      # Stamp a fresh usage boundary: the menu app counts this session's time/tokens
+      # only from here on, so a /clear (or a reopened terminal) resets its counters.
+      atomic_write "$dir/session-$tty" "$(date +%s)"
       ;;
   esac
   exit 0
@@ -156,5 +159,98 @@ print(' '.join(p.split())[:24])
     [ -n "$title" ] && atomic_write "$dir/title-$tty" "$title"
     ;;
 esac
+
+# --- Usage log (append-only, off the critical path) --------------------------
+# Append one JSONL line per event worth counting to events.jsonl, so the app's
+# stats window can tally — per day and per project — how many task runs you
+# kicked off and how many decisions you had to make. Placed dead last so it never
+# delays the row's color flip. `state` was already resolved above; map it:
+#   state = needs                          -> "decision" (each permission/plan/question)
+#   action = working + event=UserPrompt... -> "run"      (one per new user turn = one task)
+#   action = done                          -> "done"     (turn completed)
+# The run gate matches hook_event_name, NOT a bare "prompt" substring: a PreToolUse
+# for a tool that carries its own tool_input.prompt (e.g. Task/Agent) also fires as
+# "working" and would over-count runs. Idle pings already exited; a plain PreToolUse
+# working logs nothing. O_APPEND makes each one-line write atomic across ttys.
+log_event=""
+case "$state" in
+  needs) log_event="decision" ;;
+  *)
+    if [ "$action" = "done" ]; then
+      log_event="done"
+    elif [ "$action" = "working" ]; then
+      case "$input" in
+        *'"hook_event_name":"UserPromptSubmit"'*|*'"hook_event_name": "UserPromptSubmit"'*)
+          log_event="run" ;;
+      esac
+    fi ;;
+esac
+
+if [ -n "$log_event" ]; then
+  printf '%s' "$input" | EV="$log_event" TTY="$tty" DIR="$dir" /usr/bin/python3 -c '
+import sys, json, os, time
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+cwd = (d.get("cwd") or "").rstrip("/")
+project = cwd.rsplit("/", 1)[-1] if cwd else "unknown"
+title = " ".join((d.get("prompt") or "").split())[:80]
+rec = {"ts": int(time.time()), "date": time.strftime("%Y-%m-%d"),
+       "event": os.environ["EV"], "project": project or "unknown",
+       "cwd": cwd, "tty": os.environ["TTY"], "title": title}
+
+# On turn completion, tally THIS turn'"'"'s token usage from the transcript. The Stop
+# payload carries transcript_path; it points at a real file only when the session
+# actually saves one (sessions that inherit CLAUDE_CODE_CHILD_SESSION are treated as
+# children and skip the write — unset it to get transcripts back). One pass over the
+# file, resetting at every genuine user prompt, leaves the last turn standing.
+# Defensive throughout: a missing transcript just omits the token fields.
+if os.environ["EV"] == "done":
+    tp = d.get("transcript_path") or ""
+    if tp and os.path.exists(tp):
+        try:
+            turn = {}   # requestId -> usage (the one with the largest output_tokens)
+            model = ""  # last assistant model seen this turn — drives cost estimation
+            with open(tp) as tf:
+                for line in tf:
+                    line = line.strip()
+                    if not line: continue
+                    try: e = json.loads(line)
+                    except Exception: continue
+                    t = e.get("type")
+                    if t == "user":
+                        # A genuine prompt (a string, or a list with a text block) starts a
+                        # new turn; a tool_result-only user turn does not. Reset on the former.
+                        c = (e.get("message") or {}).get("content")
+                        if isinstance(c, str) or (isinstance(c, list) and any(
+                                isinstance(x, dict) and x.get("type") == "text" for x in c)):
+                            turn = {}
+                            model = ""
+                    elif t == "assistant":
+                        m = (e.get("message") or {}).get("model")
+                        if m: model = m   # keep the turn'"'"'s model for the cost table
+                        u = (e.get("message") or {}).get("usage") or {}
+                        if not u: continue
+                        # One API call streams as several assistant events sharing a
+                        # requestId; only the last carries the final output_tokens. Keep the
+                        # max per requestId so each call counts once (matches /stats, which
+                        # otherwise over-counts 3-10x).
+                        rid = e.get("requestId") or e.get("uuid") or len(turn)
+                        prev = turn.get(rid)
+                        if prev is None or u.get("output_tokens", 0) >= prev.get("output_tokens", 0):
+                            turn[rid] = u
+            us = turn.values()
+            rec.update(
+                tok_in=sum(u.get("input_tokens", 0) for u in us),
+                tok_out=sum(u.get("output_tokens", 0) for u in us),
+                tok_cache_w=sum(u.get("cache_creation_input_tokens", 0) for u in us),
+                tok_cache_r=sum(u.get("cache_read_input_tokens", 0) for u in us),
+                api_calls=len(turn))
+            if model: rec["model"] = model
+        except Exception: pass
+
+with open(os.path.join(os.environ["DIR"], "events.jsonl"), "a") as f:
+    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+' 2>/dev/null
+fi
 
 exit 0

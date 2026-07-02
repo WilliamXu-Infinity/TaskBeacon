@@ -44,11 +44,13 @@ final class StatusDot: NSView {
             g.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
 
             let scale = CABasicAnimation(keyPath: "transform.scale")
-            scale.fromValue = 0.78; scale.toValue = 1.0
+            scale.fromValue = 0.5; scale.toValue = 1.0
             let glow = CABasicAnimation(keyPath: "shadowRadius")
-            glow.fromValue = 2.5; glow.toValue = 7
+            glow.fromValue = 1.5; glow.toValue = 10
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 0.45; fade.toValue = 1.0
 
-            g.animations = [scale, glow]
+            g.animations = [scale, glow, fade]
             core.add(g, forKey: "pulse")
         }
     }

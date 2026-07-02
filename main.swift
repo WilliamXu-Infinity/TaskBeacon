@@ -17,6 +17,13 @@ struct SessionRow {
     let seq: Int           // stable 1-based session number, for a clean "会话 01" fallback
                            // label when there's no task title — never the bare ttysNNN.
 
+    // This session's usage since it began (its process start, or the last /clear —
+    // see sessionUsage). workSec = time spent running tasks (paired run->done, plus
+    // the in-flight task while working); tokens = all tokens consumed. Reset when
+    // the session is cleared or the terminal is reopened.
+    var workSec: Int = 0
+    var tokens: Int = 0
+
     // Stable identity for ack/toast bookkeeping. shellPid (the session's parent
     // shell) is unique per live process; tty+cwd keep it stable and readable even
     // if shellPid is momentarily unavailable.
@@ -349,6 +356,13 @@ class AppController: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private lazy var popoverController = MenuPopoverController(model: model)
+    // Closes the popover on any click that lands in another app / another screen.
+    // The popover is `.transient`, but we intentionally never NSApp.activate() when
+    // showing it (that would drag focus to the main window's screen), so the app
+    // stays inactive — and a transient popover's built-in auto-dismiss doesn't fire
+    // for clicks routed to other apps. Without this, clicking another display leaves
+    // the panel stranded on the wrong menu bar instead of closing.
+    private var popoverClickMonitor: Any?
     private var rows: [SessionRow] = []
     // Shared grouping / ordering / collapse state, also handed to the main window
     // so both surfaces stay in sync.
@@ -381,12 +395,15 @@ class AppController: NSObject, NSApplicationDelegate {
     private var activityToken: NSObjectProtocol?
 
     private var mainWindowController: MainWindowController?
+    private var settingsWindowController: SettingsWindowController?
+    private var statsWindowController: StatsWindowController?
 
-    // Global唤起 hotkey: press it anywhere to pop the menu-bar session list. The
-    // binding is user-editable in the main window and persisted in UserDefaults;
-    // `currentCombo` is nil only when the user has explicitly cleared it.
-    private var hotKey: GlobalHotKey!
-    private var currentCombo: HotKeyCombo?
+    // Global hotkeys (bindable in Settings, persisted per-action). `.open` pops the
+    // session list; `.nextAttention` jumps to the next needs→done session.
+    private let hotKeys = GlobalHotKeyCenter.shared
+    // The session the last nextAttention jump landed on, so repeated presses cycle
+    // through the candidates instead of sticking on the first one.
+    private var lastJumpedId: String?
 
     // Last seen status per session id; used to fire a toast only on the
     // transition *into* needs/done. `primed` suppresses a burst of toasts for
@@ -412,6 +429,13 @@ class AppController: NSObject, NSApplicationDelegate {
     private let dataDir = "\(NSHomeDirectory())/.claude/taskbeacon"
     private let vscodeExtDir = "\(NSHomeDirectory())/.vscode/extensions"
 
+    // App launch time (Unix epoch). A `done` state file written before this is a
+    // completion from a previous run — the turn ended before we were watching. Showing
+    // it green 完成 lights up every idle session on startup as if it just finished
+    // (the "一开启就全绿" bug). Only a `done` written while we're running — a real,
+    // observed completion — turns a row green; older ones fall back to 闲置.
+    private let launchTime = Date().timeIntervalSince1970
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // .regular = full app with a Dock icon + main window (not a pure menu-bar
         // accessory). The status item and toasts still work alongside it.
@@ -427,21 +451,26 @@ class AppController: NSObject, NSApplicationDelegate {
 
         popover.behavior = .transient
         popover.animates = true
+        popover.delegate = self
         popover.contentViewController = popoverController
         popoverController.onJump         = { [weak self] row in self?.popover.performClose(nil); self?.focus(row) }
         popoverController.onOpenWindow   = { [weak self] in self?.popover.performClose(nil); self?.openMainWindow() }
+        popoverController.onOpenStats    = { [weak self] in self?.popover.performClose(nil); self?.openStats() }
         popoverController.onRefresh      = { [weak self] in self?.manualRefresh() }
+        popoverController.onOpenSettings = { [weak self] in self?.popover.performClose(nil); self?.openSettings() }
         popoverController.onQuit         = { [weak self] in self?.quit() }
         popoverController.onFixPermission = { [weak self] in self?.popover.performClose(nil); self?.presentAccessibilityPrompt() }
 
         activityToken = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated], reason: "Live Claude session monitoring")
 
-        // Global唤起 hotkey — bind the saved (or default) combo so pressing it from
-        // any app pops the session list open. nil means the user cleared it.
-        currentCombo = HotKeyCombo.load()
-        hotKey = GlobalHotKey { [weak self] in self?.openFromHotKey() }
-        if let combo = currentCombo { hotKey.update(combo) }
+        // Global hotkeys — bind each action's saved (or default) combo so it works
+        // from any app. A nil combo means the user cleared that binding.
+        for action in HotKeyAction.allCases {
+            hotKeys.bind(action, combo: HotKeyStore.load(action)) { [weak self] in
+                self?.fireHotKey(action)
+            }
+        }
 
         lastFocusToken = readFocusToken()   // prime: ignore whatever focus is already recorded
         showMainWindow()
@@ -567,17 +596,83 @@ class AppController: NSObject, NSApplicationDelegate {
         var seqOf: [pid_t: Int] = [:]
         for (i, pid) in sessions.map({ $0.shellPid }).sorted().enumerated() { seqOf[pid] = i + 1 }
 
+        // Per-session usage counters. Parse the append-only event log once and group by
+        // tty; each session sums only its own events since it began (see sessionUsage).
+        var eventsByTty: [String: [UsageEvent]] = [:]
+        for e in StatsStore.parse(StatsStore.logPath) {
+            if let t = e.tty { eventsByTty[t, default: []].append(e) }
+        }
+        let now = Date().timeIntervalSince1970
+
         // Real status only; ack-overlay + final sort happen on the main thread.
         return sessions.map { s in
             let folder = (s.cwd as NSString).lastPathComponent
             let seq = seqOf[s.shellPid] ?? 0
             let dup = (folderCount[s.cwd] ?? 0) > 1
             let title = dup ? "\(folder) · \(String(format: "%02d", seq))" : folder
-            return SessionRow(title: title, folder: folder, cwd: s.cwd,
-                              shellPid: s.shellPid, tty: s.tty,
-                              status: sessionStatus(tty: s.tty),
-                              taskTitle: sessionTitle(tty: s.tty), seq: seq)
+            // A "needs" row means a PermissionRequest hook fired when a dialog appeared,
+            // but Claude Code emits no hook the instant you APPROVE — see runningToolCommand.
+            // If a command that started AFTER the dialog is running, you've approved and
+            // work resumed: paint 蓝, not 红. The `needs` write time = the state file mtime.
+            var status = sessionStatus(tty: s.tty)
+            if status == "needs" {
+                let since = fileMTime("\(dataDir)/state-\(s.tty)")
+                if runningToolCommand(claudePid: s.claudePid, since: since) {
+                    status = "working"
+                }
+            } else if status == "done",
+                      fileMTime("\(dataDir)/state-\(s.tty)") < launchTime {
+                // Stale completion from before the app started watching — show 闲置,
+                // not a fresh green 完成. A done observed live keeps its newer mtime.
+                status = "idle"
+            }
+            // Usage since this session began: the later of its process start and the
+            // last /clear boundary the hook stamped (session-<tty>). Events before that
+            // belong to a previous conversation on the same terminal — excluded.
+            let boundary = max(processStartEpoch(s.claudePid) ?? 0,
+                               fileMTime("\(dataDir)/session-\(s.tty)"))
+            let (workSec, tokens) = sessionUsage(eventsByTty[s.tty] ?? [],
+                                                 boundary: boundary,
+                                                 working: status == "working", now: now)
+            var row = SessionRow(title: title, folder: folder, cwd: s.cwd,
+                                 shellPid: s.shellPid, tty: s.tty,
+                                 status: status,
+                                 taskTitle: sessionTitle(tty: s.tty), seq: seq)
+            row.workSec = workSec
+            row.tokens = tokens
+            return row
         }
+    }
+
+    // Sum a session's usage from its own log events since `boundary`. workSec pairs each
+    // run with the next done on the tty (guarded against absurd gaps); if the session is
+    // currently working, the in-flight run counts live up to `now`. tokens sums every
+    // token type across done events.
+    private func sessionUsage(_ events: [UsageEvent], boundary: Double,
+                              working: Bool, now: Double) -> (workSec: Int, tokens: Int) {
+        var work = 0, tokens = 0
+        var openRun: Int?
+        for e in events.sorted(by: { $0.ts < $1.ts }) where Double(e.ts) >= boundary {
+            switch e.event {
+            case "run":
+                openRun = e.ts
+            case "done":
+                if let start = openRun {
+                    let d = e.ts - start
+                    if d >= 0 && d < 24 * 3600 { work += d }
+                    openRun = nil
+                }
+                tokens += (e.tok_in ?? 0) + (e.tok_out ?? 0)
+                        + (e.tok_cache_w ?? 0) + (e.tok_cache_r ?? 0)
+            default:
+                break
+            }
+        }
+        if working, let start = openRun {
+            let d = Int(now) - start
+            if d >= 0 && d < 24 * 3600 { work += d }
+        }
+        return (work, tokens)
     }
 
     // Overlay the user's acknowledgements, then sort into a FIXED order. Runs on the
@@ -589,9 +684,12 @@ class AppController: NSObject, NSApplicationDelegate {
         var rows = realRows.map { r -> SessionRow in
             if let a = acked[r.id] {
                 if a == r.status {                        // still the acked state → gray
-                    return SessionRow(title: r.title, folder: r.folder, cwd: r.cwd,
-                                      shellPid: r.shellPid, tty: r.tty, status: "seen",
-                                      taskTitle: r.taskTitle, seq: r.seq)
+                    var seen = SessionRow(title: r.title, folder: r.folder, cwd: r.cwd,
+                                          shellPid: r.shellPid, tty: r.tty, status: "seen",
+                                          taskTitle: r.taskTitle, seq: r.seq)
+                    seen.workSec = r.workSec
+                    seen.tokens = r.tokens
+                    return seen
                 }
                 acked.removeValue(forKey: r.id)           // moved on → real color returns
             }
@@ -629,6 +727,7 @@ class AppController: NSObject, NSApplicationDelegate {
         let cwd: String
         let shellPid: pid_t
         let tty: String
+        let claudePid: pid_t   // the interactive `claude` process itself (for the busy probe)
     }
 
     private func discoverSessions() -> [LiveSession] {
@@ -654,7 +753,8 @@ class AppController: NSObject, NSApplicationDelegate {
             out.append(LiveSession(
                 cwd: cwd,
                 shellPid: bsd?.ppid ?? 0,
-                tty: bsd?.tty ?? ""))
+                tty: bsd?.tty ?? "",
+                claudePid: pid))
         }
         return out
     }
@@ -666,6 +766,66 @@ class AppController: NSObject, NSApplicationDelegate {
         let n = proc_listpids(UInt32(PROC_ALL_PIDS), 0, &pids, cap)
         guard n > 0 else { return [] }
         return Array(pids.prefix(Int(n) / MemoryLayout<pid_t>.size)).filter { $0 > 0 }
+    }
+
+    // Direct children of `pid` (one libproc call, filtered by parent pid).
+    private func childPIDs(_ pid: pid_t) -> [pid_t] {
+        let cap = proc_listpids(UInt32(PROC_PPID_ONLY), UInt32(pid), nil, 0)
+        guard cap > 0 else { return [] }
+        var pids = [pid_t](repeating: 0, count: Int(cap) / MemoryLayout<pid_t>.size)
+        let n = proc_listpids(UInt32(PROC_PPID_ONLY), UInt32(pid), &pids, cap)
+        guard n > 0 else { return [] }
+        return Array(pids.prefix(Int(n) / MemoryLayout<pid_t>.size)).filter { $0 > 0 }
+    }
+
+    // A file's mtime as a Unix epoch, or 0 if it can't be read.
+    private func fileMTime(_ path: String) -> Double {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let d = attrs[.modificationDate] as? Date else { return 0 }
+        return d.timeIntervalSince1970
+    }
+
+    // A process's start time as a Unix epoch (wall clock), so it can be compared
+    // against a file's mtime. From proc_bsdinfo's pbi_start_tv{sec,usec}.
+    private func processStartEpoch(_ pid: pid_t) -> Double? {
+        var info = proc_bsdinfo()
+        let sz = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sz) == sz else { return nil }
+        return Double(info.pbi_start_tvsec) + Double(info.pbi_start_tvusec) / 1_000_000
+    }
+
+    // Bridge the permission-approval blind spot behind the red "needs" pill.
+    //
+    // A row goes red because the PermissionRequest hook fires the instant a dialog
+    // appears. But Claude Code emits NO hook when you APPROVE — the next signal for
+    // that tool is its PostToolUse, which for a long *foreground* command only fires
+    // when the command finally exits. So an already-approved, still-running command
+    // sits red the entire time it runs (the "确认过了还是红" bug).
+    //
+    // Ground truth for "the dialog is gone and work is underway" lives in the process
+    // tree: Claude Code runs a Bash tool by spawning its snapshot shell — `zsh -c …`
+    // (or bash/sh -c) — as a child of the `claude` process. The `-c` keeps this precise:
+    // only command-invocation shells carry it, never an idle interactive login shell.
+    //
+    // But a command shell alone isn't enough: a session can have a LEFTOVER command
+    // still alive (an earlier `expo start` dev server) AND a fresh, genuinely-pending
+    // dialog for a different tool. That leftover must NOT clear the red. The tell is
+    // TIMING: the just-approved command spawns AFTER the dialog appeared, i.e. after the
+    // state file flipped to "needs". So only count a command shell that started later
+    // than that `needs` write (`since`). Leftovers predate it and are correctly ignored.
+    private func runningToolCommand(claudePid: pid_t, since: Double) -> Bool {
+        guard claudePid > 0 else { return false }
+        for c in childPIDs(claudePid) {
+            let args = processArgs(c)
+            guard let a0 = args.first else { continue }
+            let name = (a0 as NSString).lastPathComponent
+            guard name == "zsh" || name == "bash" || name == "sh", args.contains("-c")
+            else { continue }
+            if let started = processStartEpoch(c), started > since {
+                return true
+            }
+        }
+        return false
     }
 
     // argv via KERN_PROCARGS2 layout:
@@ -820,19 +980,58 @@ class AppController: NSObject, NSApplicationDelegate {
 
     // MARK: Popover (menu-bar dropdown)
 
-    // The global hotkey fired: pop the menu-bar list open so the user sees every
-    // live session at a glance. Reuses the status-item toggle (press again to
-    // dismiss), matching how a menu-bar app's hotkey normally behaves.
-    private func openFromHotKey() {
-        togglePopover()
+    // Route a fired global hotkey to its action.
+    private func fireHotKey(_ action: HotKeyAction) {
+        switch action {
+        case .open:          togglePopover()          // pop the list (press again to dismiss)
+        case .nextAttention: jumpToNextAttention()
+        }
     }
 
-    // User rebound (or cleared) the唤起 hotkey in the main window. Persist it and
+    // Jump straight to the next session awaiting you: cycle through the "needs"
+    // (红, awaiting confirmation) rows ONLY — no other status counts. If nothing is
+    // needs, do nothing. `lastJumpedId` advances the cycle so repeated presses walk
+    // the whole set instead of re-focusing the first.
+    private func jumpToNextAttention() {
+        let pool = rows.filter { $0.status == "needs" }
+        guard !pool.isEmpty else { return }   // nothing needs confirmation → no-op
+        let idx: Int
+        if let last = lastJumpedId, let i = pool.firstIndex(where: { $0.id == last }) {
+            idx = (i + 1) % pool.count        // advance from where we last landed
+        } else {
+            idx = 0
+        }
+        lastJumpedId = pool[idx].id
+        focus(pool[idx])
+    }
+
+    // User rebound (or cleared) an action's hotkey in Settings. Persist it and
     // re-register the Carbon binding; nil clears it entirely.
-    private func rebindHotKey(_ combo: HotKeyCombo?) {
-        currentCombo = combo
-        HotKeyCombo.persist(combo)
-        if let combo = combo { hotKey.update(combo) } else { hotKey.unregister() }
+    private func rebindHotKey(_ action: HotKeyAction, _ combo: HotKeyCombo?) {
+        HotKeyStore.persist(action, combo)
+        hotKeys.rebind(action, combo: combo)
+    }
+
+    // MARK: Settings window
+
+    private func openSettings() {
+        if settingsWindowController == nil {
+            let sc = SettingsWindowController()
+            sc.onRebind = { [weak self] action, combo in self?.rebindHotKey(action, combo) }
+            for action in HotKeyAction.allCases { sc.setCombo(action, HotKeyStore.load(action)) }
+            settingsWindowController = sc
+        }
+        settingsWindowController?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    // MARK: Stats window
+
+    private func openStats() {
+        if statsWindowController == nil { statsWindowController = StatsWindowController() }
+        statsWindowController?.refresh()   // re-read the log so it opens current
+        statsWindowController?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc private func togglePopover() {
@@ -840,10 +1039,19 @@ class AppController: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         refresh()                       // land fresh data before the panel appears
         popoverController.reload(rows)
-        // Activate so the transient popover can become key and receive the
-        // click-outside that dismisses it (a status click alone doesn't activate us).
-        NSApp.activate(ignoringOtherApps: true)
+        // Anchor to the status button, so on multi-display the popover lands on the
+        // screen whose menu bar was clicked. Do NOT NSApp.activate() first — that
+        // pulls focus to the main window's screen and the popover follows it there.
+        // Instead make just the popover's own window key so it still receives the
+        // list's clicks/drags and the click-outside that dismisses it.
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
+        // Global monitor fires only for events delivered to *other* apps — i.e. a click
+        // on another window or another screen's menu bar. Clicks inside our own popover
+        // go through the local responder chain, not here, so they don't dismiss it.
+        popoverClickMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] _ in self?.popover.performClose(nil) }
     }
 
     // MARK: Actions
@@ -938,7 +1146,7 @@ class AppController: NSObject, NSApplicationDelegate {
         // withholds window names otherwise). Can't map cwd→window; prompt once, activate.
         if titled.isEmpty {
             requestScreenRecordingIfNeeded()
-            app.activate(options: [])
+            app.activate(options: [.activateIgnoringOtherApps])
             return
         }
 
@@ -964,7 +1172,7 @@ class AppController: NSObject, NSApplicationDelegate {
         guard let wid = target else {
             NSLog("TB jump: NO title matched components=%@ → plain activate",
                   components.joined(separator: ","))
-            app.activate(options: [])
+            app.activate(options: [.activateIgnoringOtherApps])
             return
         }
         NSLog("TB jump: matched wid=%d → switchToSpace+AXraise+activate", wid)
@@ -978,7 +1186,7 @@ class AppController: NSObject, NSApplicationDelegate {
         //      the CURRENT Space, so it must run after switchToSpace.
         switchToSpace(of: wid)
         raiseAXWindow(pid: pid, components: components)
-        app.activate(options: [])
+        app.activate(options: [.activateIgnoringOtherApps])
     }
 
     // VSCode titles look like "file.ext — RootName — Visual Studio Code", joined by the
@@ -1029,7 +1237,13 @@ class AppController: NSObject, NSApplicationDelegate {
 
         AXUIElementSetAttributeValue(target, kAXMainAttribute as CFString, kCFBooleanTrue)
         AXUIElementPerformAction(target, kAXRaiseAction as CFString)
-        NSLog("TB jump: raiseAXWindow raised matching window")
+        // Raising the window fixes z-order but NOT keyboard focus: without this the
+        // window comes forward while keystrokes still go to whatever app the user was
+        // typing in. kAXFrontmostAttribute is the AX-level "make this app key" — more
+        // reliable at stealing key focus from another regular app than activate() alone
+        // (which macOS treats as cooperative and may defer when we're a background utility).
+        AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        NSLog("TB jump: raiseAXWindow raised matching window + set app frontmost")
     }
 
     // MARK: Private CGS — cross-Space window control
@@ -1204,8 +1418,8 @@ class AppController: NSObject, NSApplicationDelegate {
             let wc = MainWindowController(model: model)
             wc.onJump = { [weak self] row in self?.focus(row) }
             wc.onRefresh = { [weak self] in self?.refresh() }
-            wc.onRebind = { [weak self] combo in self?.rebindHotKey(combo) }
-            wc.setHotKeyCombo(currentCombo)
+            wc.onOpenStats = { [weak self] in self?.openStats() }
+            wc.onOpenSettings = { [weak self] in self?.openSettings() }
             mainWindowController = wc
         }
         mainWindowController?.reload(rows)
@@ -1232,6 +1446,16 @@ class AppController: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag { showMainWindow() }
         return true
+    }
+}
+
+// MARK: - Popover lifecycle
+
+extension AppController: NSPopoverDelegate {
+    // Every close path funnels through here (outside click, jump, action button),
+    // so tear the global monitor down in one place.
+    func popoverDidClose(_ notification: Notification) {
+        if let m = popoverClickMonitor { NSEvent.removeMonitor(m); popoverClickMonitor = nil }
     }
 }
 

@@ -9,47 +9,67 @@ import Carbon.HIToolbox
 // global hotkey): it needs no Accessibility permission and consumes the key so it
 // won't leak into whatever app is frontmost.
 
+// The bindable actions, each with its own persisted combo + default. rawValue is
+// the Carbon EventHotKeyID.id used to tell them apart in the shared event handler.
+enum HotKeyAction: UInt32, CaseIterable {
+    case open = 1           // pop the menu-bar session list
+    case nextAttention = 2  // jump to the next needs→done session
+
+    // ⌃⌥⌘ + a memorable letter. Triple-modifier defaults are very unlikely to
+    // collide with an existing global hotkey; all rebindable in Settings.
+    var defaultCombo: HotKeyCombo {
+        let mods = UInt32(controlKey | optionKey | cmdKey)
+        switch self {
+        case .open:          return HotKeyCombo(keyCode: UInt32(kVK_ANSI_B), modifiers: mods) // Beacon
+        case .nextAttention: return HotKeyCombo(keyCode: UInt32(kVK_ANSI_N), modifiers: mods) // Next
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .open:          return "唤起会话列表"
+        case .nextAttention: return "跳到下一个待确认"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .open:          return "弹出菜单栏列表，看都有哪些在跑"
+        case .nextAttention: return "依次跳到需确认的会话；没有则不跳"
+        }
+    }
+
+    fileprivate var keyCodeDefaultsKey: String { "hotkey.\(rawValue).keyCode" }
+    fileprivate var modDefaultsKey: String     { "hotkey.\(rawValue).modifiers" }
+}
+
+// Per-action persistence. A never-set action falls back to its default; a user who
+// clears a binding stores a sentinel (keyCode UInt32.max) so load() returns nil
+// instead of silently reviving the default.
+enum HotKeyStore {
+    static func load(_ action: HotKeyAction) -> HotKeyCombo? {
+        let d = UserDefaults.standard
+        guard d.object(forKey: action.keyCodeDefaultsKey) != nil else { return action.defaultCombo }
+        let code = UInt32(bitPattern: Int32(truncatingIfNeeded: d.integer(forKey: action.keyCodeDefaultsKey)))
+        if code == UInt32.max { return nil }   // explicitly unbound
+        let mods = UInt32(bitPattern: Int32(truncatingIfNeeded: d.integer(forKey: action.modDefaultsKey)))
+        return HotKeyCombo(keyCode: code, modifiers: mods)
+    }
+
+    static func persist(_ action: HotKeyAction, _ combo: HotKeyCombo?) {
+        let d = UserDefaults.standard
+        d.set(Int(Int32(bitPattern: combo?.keyCode ?? UInt32.max)), forKey: action.keyCodeDefaultsKey)
+        d.set(Int(Int32(bitPattern: combo?.modifiers ?? 0)), forKey: action.modDefaultsKey)
+    }
+}
+
 // A key-code + modifier-flags combo. Modifiers live in Carbon's flag space
 // (cmdKey/optionKey/…) because that's what RegisterEventHotKey consumes; the
-// recorder converts from NSEvent's flags on capture. Persisted to UserDefaults so
-// the binding survives relaunches.
+// recorder converts from NSEvent's flags on capture.
 struct HotKeyCombo: Equatable {
     var keyCode: UInt32
     var modifiers: UInt32   // Carbon mask: cmdKey | optionKey | controlKey | shiftKey
 
-    // ⌃⌥⌘B — "B" for Beacon. A triple-modifier default that's memorable and very
-    // unlikely to collide with an existing global hotkey; rebindable below.
-    static let `default` = HotKeyCombo(
-        keyCode: UInt32(kVK_ANSI_B),
-        modifiers: UInt32(controlKey | optionKey | cmdKey))
-
-    private static let keyCodeDefault = "hotkey.keyCode"
-    private static let modDefault     = "hotkey.modifiers"
-
-    // Returns nil only when the user has explicitly cleared the binding (a sentinel
-    // keyCode of UInt32.max is stored for that); an untouched install falls back to
-    // `.default` at the call site.
-    static func load() -> HotKeyCombo? {
-        let d = UserDefaults.standard
-        guard d.object(forKey: keyCodeDefault) != nil else { return .default }
-        let code = UInt32(bitPattern: Int32(truncatingIfNeeded: d.integer(forKey: keyCodeDefault)))
-        if code == UInt32.max { return nil }   // explicitly unbound
-        return HotKeyCombo(code: code,
-                           modifiers: UInt32(bitPattern: Int32(truncatingIfNeeded: d.integer(forKey: modDefault))))
-    }
-
-    // Distinguish "unbound" (persist a sentinel so load() knows the user chose it)
-    // from "never set" (no key at all → default).
-    static func persist(_ combo: HotKeyCombo?) {
-        let d = UserDefaults.standard
-        let code = combo?.keyCode ?? UInt32.max
-        d.set(Int(Int32(bitPattern: code)), forKey: keyCodeDefault)
-        d.set(Int(Int32(bitPattern: combo?.modifiers ?? 0)), forKey: modDefault)
-    }
-
-    private init(code: UInt32, modifiers: UInt32) {
-        self.keyCode = code; self.modifiers = modifiers
-    }
     init(keyCode: UInt32, modifiers: UInt32) {
         self.keyCode = keyCode; self.modifiers = modifiers
     }
@@ -108,24 +128,19 @@ struct HotKeyCombo: Equatable {
     ]
 }
 
-// Owns the Carbon hotkey registration + a single app-wide event handler. update()
-// (re)binds to a new combo; unregister() drops it entirely (user cleared the key).
-final class GlobalHotKey {
-    private var ref: EventHotKeyRef?
+// Owns every Carbon hotkey registration behind ONE app-wide event handler that
+// dispatches by EventHotKeyID.id (== HotKeyAction.rawValue). bind() wires an action
+// to its callback + combo; rebind() swaps the key (nil clears it). A no-modifier
+// combo is rejected upstream by the recorder, so we never grab a bare key globally.
+final class GlobalHotKeyCenter {
+    static let shared = GlobalHotKeyCenter()
+
     private var handler: EventHandlerRef?
-    private let onFire: () -> Void
+    private var refs: [UInt32: EventHotKeyRef] = [:]
+    private var fires: [UInt32: () -> Void] = [:]
     private let signature: OSType = 0x5442_4859   // 'TBHY'
-    private let hotKeyID: UInt32 = 1
 
-    init(onFire: @escaping () -> Void) {
-        self.onFire = onFire
-        installHandler()
-    }
-
-    deinit {
-        unregister()
-        if let handler = handler { RemoveEventHandler(handler) }
-    }
+    private init() { installHandler() }
 
     private func installHandler() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
@@ -133,27 +148,33 @@ final class GlobalHotKey {
         let this = Unmanaged.passUnretained(self).toOpaque()
         InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
             guard let userData = userData, let event = event else { return noErr }
-            let me = Unmanaged<GlobalHotKey>.fromOpaque(userData).takeUnretainedValue()
+            let me = Unmanaged<GlobalHotKeyCenter>.fromOpaque(userData).takeUnretainedValue()
             var id = EventHotKeyID()
             GetEventParameter(event, EventParamName(kEventParamDirectObject),
                               EventParamType(typeEventHotKeyID), nil,
                               MemoryLayout<EventHotKeyID>.size, nil, &id)
-            if id.id == me.hotKeyID { DispatchQueue.main.async { me.onFire() } }
+            if let fire = me.fires[id.id] { DispatchQueue.main.async { fire() } }
             return noErr
         }, 1, &spec, this, &handler)
     }
 
-    // Bind (or rebind) the global hotkey. A no-modifier combo is rejected upstream
-    // by the recorder, so we never grab a bare key system-wide here.
-    func update(_ combo: HotKeyCombo) {
-        unregister()
-        let id = EventHotKeyID(signature: signature, id: hotKeyID)
-        RegisterEventHotKey(combo.keyCode, combo.modifiers, id,
-                            GetApplicationEventTarget(), 0, &ref)
+    func bind(_ action: HotKeyAction, combo: HotKeyCombo?, onFire: @escaping () -> Void) {
+        fires[action.rawValue] = onFire
+        register(action, combo)
     }
 
-    func unregister() {
-        if let ref = ref { UnregisterEventHotKey(ref); self.ref = nil }
+    func rebind(_ action: HotKeyAction, combo: HotKeyCombo?) {
+        register(action, combo)
+    }
+
+    private func register(_ action: HotKeyAction, _ combo: HotKeyCombo?) {
+        if let ref = refs[action.rawValue] { UnregisterEventHotKey(ref); refs[action.rawValue] = nil }
+        guard let combo = combo else { return }
+        let id = EventHotKeyID(signature: signature, id: action.rawValue)
+        var ref: EventHotKeyRef?
+        RegisterEventHotKey(combo.keyCode, combo.modifiers, id,
+                            GetApplicationEventTarget(), 0, &ref)
+        refs[action.rawValue] = ref
     }
 }
 
